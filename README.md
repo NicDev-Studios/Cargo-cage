@@ -29,6 +29,17 @@ security guarantee and it is not a replacement for a hardened build service.
 
 ## Requirements and installation
 
+The public crates use the `cargo-cage` prefix so their names stay together on
+crates.io:
+
+- `cargo-cage` — the CLI
+- `cargo-cage-core` — platform-neutral policy and backend types
+- `cargo-cage-cargo` — Cargo integration
+- `cargo-cage-linux` — Bubblewrap backend for Linux
+
+`cage-testkit` contains deliberately malicious test fixtures and remains a
+workspace-private crate.
+
 The reference environment is Ubuntu 24.04 x86_64 with unprivileged user
 namespaces enabled and Bubblewrap 0.8 or newer.
 
@@ -40,8 +51,17 @@ the policy globally.
 
 ```sh
 sudo apt-get install bubblewrap
-cargo install --path cargo-cage
+cargo install --path cargo-cage --locked
 ```
+
+Once a crates.io release is available, the CLI can be installed with:
+
+```sh
+cargo install cargo-cage --locked --version 0.2.0
+```
+
+The repository's crates.io workflow is tag-driven and protected by a GitHub
+environment approval. Normal pushes and pull requests do not publish packages.
 
 Cargo is forced into offline mode. Fetch dependencies as a separate,
 intentional step before using the cage:

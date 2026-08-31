@@ -1,14 +1,23 @@
 [package]
-name = "cage-cargo"
+name = "cargo-cage-cargo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+repository.workspace = true
+readme.workspace = true
+description = "Cargo integration for the cargo-cage build sandbox."
+keywords = ["cargo", "sandbox", "security", "build-script"]
+categories = ["development-tools::cargo-plugins"]
+publish = true
 
 [lints]
 workspace = true
 
+[lib]
+name = "cage_cargo"
+path = "src/lib.rs"
+
 [dependencies]
-cage-core = { path = "../cage-core" }
+cage-core = { package = "cargo-cage-core", path = "../cage-core", version = "0.2.0" }

@@ -1,0 +1,108 @@
+name: Publish crates.io release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish crates.io packages
+    runs-on: ubuntu-24.04
+    environment:
+      # Configure this environment with required reviewers and the
+      # CARGO_REGISTRY_TOKEN secret before creating a release tag.
+      name: crates-io
+      url: https://crates.io/
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cargo-cage") | .version')"
+          actual="${GITHUB_REF_NAME#v}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Tag v$actual does not match workspace version $expected"
+            exit 1
+          fi
+
+      - name: Inspect package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in cargo-cage-core cargo-cage-cargo cargo-cage-linux cargo-cage; do
+            echo "--- $package ---"
+            cargo package --locked --package "$package" --list
+          done
+
+      - name: Dry-run and publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured in the crates-io environment"
+            exit 1
+          fi
+
+          for package in cargo-cage-core cargo-cage-cargo cargo-cage-linux cargo-cage; do
+            echo "--- dry-run: $package ---"
+            env -u CARGO_REGISTRY_TOKEN cargo publish --locked --package "$package" --dry-run
+            echo "--- publish: $package ---"
+            # The dry-run above verifies the package without credentials. The
+            # upload skips verification so package build code never receives
+            # the crates.io token from this step.
+            cargo publish --locked --package "$package" --no-verify
+          done
+
+  verify-install:
+    name: Verify fresh Ubuntu installation
+    needs: publish
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare Ubuntu for Bubblewrap namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            test "$(< /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 0
+          fi
+
+      - name: Install sandbox runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+
+      - name: Install cargo-cage from crates.io
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: cargo install cargo-cage --locked --version "${VERSION#v}"
+
+      - name: Run a clean Cargo smoke build
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$(mktemp -d)"
+          cargo new --quiet --bin "$smoke_dir/smoke-project"
+          cd "$smoke_dir/smoke-project"
+          cargo-cage --help >/dev/null
+          cargo cage build

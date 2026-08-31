@@ -14,6 +14,8 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["NicDevTV"]
+repository = "https://github.com/NicDev-Studios/Cargo-cage"
+readme = "README.md"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1,14 +1,23 @@
 [package]
-name = "cage-linux"
+name = "cargo-cage-linux"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+repository.workspace = true
+readme.workspace = true
+description = "Linux Bubblewrap backend for cargo-cage."
+keywords = ["linux", "sandbox", "security", "bubblewrap"]
+categories = ["os", "development-tools"]
+publish = true
 
 [lints]
 workspace = true
 
+[lib]
+name = "cage_linux"
+path = "src/lib.rs"
+
 [dependencies]
-cage-core = { path = "../cage-core" }
+cage-core = { package = "cargo-cage-core", path = "../cage-core", version = "0.2.0" }
