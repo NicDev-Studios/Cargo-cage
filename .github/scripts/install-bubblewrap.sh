@@ -5,7 +5,7 @@ readonly required_version="0.12.0"
 readonly archive_name="bubblewrap-0.12.0.tar.xz"
 readonly archive_url="https://github.com/containers/bubblewrap/releases/download/v0.12.0/${archive_name}"
 # SHA-256 of the official bubblewrap 0.12.0 source archive.
-readonly archive_sha256="9760d007363e3abba7c7474899100ff44d9fca53ba3bd3282e396fa3c97a3314"
+readonly archive_sha256="9760d007363e3abba7c747489910f9f82d9fca53ba3bd3282e396fa3c97a3314"
 readonly work_dir="$(mktemp -d)"
 
 cleanup() {
