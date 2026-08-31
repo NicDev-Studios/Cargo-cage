@@ -17,8 +17,8 @@ exclude = ["tests/**"]
 workspace = true
 
 [dependencies]
-cage-cargo = { package = "cargo-cage-cargo", path = "../cage-cargo", version = "0.2.0" }
-cage-linux = { package = "cargo-cage-linux", path = "../cage-linux", version = "0.2.0" }
+cage-cargo = { package = "cargo-cage-cargo", path = "../cage-cargo", version = "0.3.0" }
+cage-linux = { package = "cargo-cage-linux", path = "../cage-linux", version = "0.3.0" }
 
 [dev-dependencies]
 cage-core = { package = "cargo-cage-core", path = "../cage-core" }

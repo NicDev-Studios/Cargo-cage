@@ -2,7 +2,8 @@
 
 ## Scope
 
-This document describes the intended boundary of the experimental Linux MVP.
+This document describes the intended boundary of the experimental Linux v0.3
+workflow.
 It is not proof that the boundary holds against an unknown kernel, Bubblewrap
 bug, or toolchain vulnerability.
 
@@ -58,7 +59,13 @@ Paths are checked and canonicalized before they are mounted. Writable target
 paths, the lockfile, and paths used for sandbox mounts must not rely on unsafe
 symlink resolution. A missing, old, or broken sandbox prerequisite aborts the
 operation before the real Cargo process starts. There is no unsandboxed
-fallback and no automatic network fetch.
+fallback and no automatic network fetch. `build`, `check`, `test`, and `doc`
+are supported; `run`, `publish`, `fmt`, and arbitrary Cargo commands are not.
+
+`cargo cage doctor` repeats the relevant host and project validation without
+creating project files. Missing target directories, lockfiles, or caches are
+reported as warnings when they are safe to create or can be prepared with a
+separate `cargo fetch`.
 
 ## What this protects
 
@@ -68,7 +75,8 @@ fallback and no automatic network fetch.
 - Known credential and agent variables are not passed to the child.
 - Writes to the read-only workspace, including writes through a symlink from
   `target`, fail with a normal operating-system error.
-- Child processes inherit the mount and namespace boundary.
+- Child processes, test binaries, and compiler helpers inherit the mount and
+  namespace boundary.
 - A malformed or unsafe Cargo cache stops the build before Cargo starts.
 - A missing, old, or non-working Bubblewrap backend stops the build before the
   real Cargo process runs.

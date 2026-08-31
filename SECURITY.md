@@ -1,7 +1,7 @@
 # Security
 
-`cargo-cage` is experimental software. Version 0.2 is an additional guard
-around local Cargo builds, not a complete sandbox and not a promise that a
+`cargo-cage` is experimental software. Version 0.3 is an additional guard
+around local Cargo operations, not a complete sandbox and not a promise that a
 malicious build cannot escape.
 
 The intended boundary, trust assumptions, and residual risk are documented in
@@ -24,7 +24,11 @@ target and workspace lockfile.
 Sensitive environment variables and selected home paths are removed or hidden.
 Cargo runs with a private `CARGO_HOME`; only validated registry and Git caches
 are exposed read-only. User Cargo configuration is not mounted because it may
-contain credentials.
+contain credentials. `build`, `check`, `test`, and `doc` use the same policy;
+`test` binaries and their child processes remain inside the sandbox.
+
+`cargo cage doctor` performs the same host, workspace, path, cache, and
+Bubblewrap preflight checks without creating a target directory or lockfile.
 
 These controls are defense-in-depth. They depend on the Linux kernel,
 Bubblewrap, Cargo, Rustc, the host security policy, and the selected toolchain

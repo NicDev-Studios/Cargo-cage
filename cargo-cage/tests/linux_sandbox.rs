@@ -11,7 +11,9 @@ use std::process::{Command, Output};
 #[test]
 fn linux_sandbox_acceptance_matrix() {
     simple_build_works();
+    supported_cargo_commands_work();
     out_dir_is_writable();
+    doctor_is_non_mutating();
     sensitive_home_path_is_hidden();
     sensitive_environment_is_removed();
     cargo_config_is_hidden();
@@ -37,11 +39,37 @@ fn simple_build_works() {
     assert!(fixture.file("target/debug/cage-simple-build").is_file());
 }
 
+fn supported_cargo_commands_work() {
+    for command in ["check", "test", "doc"] {
+        let fixture = materialize("simple-build").expect("simple fixture");
+        let output = run_cage_command(&fixture, command, &[]);
+        assert_success(&output);
+    }
+}
+
 fn out_dir_is_writable() {
     let fixture = materialize("out-dir-build").expect("OUT_DIR fixture");
     let output = run_cage(&fixture, &[]);
     assert_success(&output);
     assert!(find_file(&fixture.file("target"), "cage-output.txt"));
+}
+
+fn doctor_is_non_mutating() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let lockfile = fixture.file("Cargo.lock");
+    let lock_before = fs::read(&lockfile).expect("fixture lockfile");
+    assert!(!fixture.file("target").exists());
+
+    let output = run_doctor(&fixture, false);
+    assert_success(&output);
+    let text = output_text(&output);
+    assert!(text.contains("cargo-cage doctor"), "{text}");
+    assert!(text.contains("sandbox preflight"), "{text}");
+    assert!(!fixture.file("target").exists());
+    assert_eq!(
+        fs::read(&lockfile).expect("lockfile after doctor"),
+        lock_before
+    );
 }
 
 fn sensitive_home_path_is_hidden() {
@@ -339,11 +367,36 @@ fn run_cage(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
 }
 
 fn run_cage_with_env(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
-    let mut command = base_command(fixture);
+    let mut command = base_command_for(fixture, "build");
     for (key, value) in extra {
         command.env(key, value);
     }
     command.output().expect("run cargo-cage")
+}
+
+fn run_cage_command(fixture: &Fixture, cargo_command: &str, extra: &[(&str, &str)]) -> Output {
+    let mut command = base_command_for(fixture, cargo_command);
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command.output().expect("run cargo-cage")
+}
+
+fn run_doctor(fixture: &Fixture, verbose: bool) -> Output {
+    let cargo_home = test_cargo_home(fixture);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cage"));
+    command
+        .current_dir(fixture.path())
+        .arg("doctor")
+        .env("HOME", fixture.file("fake-home"))
+        .env("CARGO_HOME", cargo_home)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    if verbose {
+        command.arg("--verbose");
+    }
+    apply_rustup_home(&mut command);
+    command.output().expect("run cargo-cage doctor")
 }
 
 fn run_cage_with_cargo_home(
@@ -359,12 +412,12 @@ fn run_cage_with_cargo_home(
     command.output().expect("run cargo-cage")
 }
 
-fn base_command(fixture: &Fixture) -> Command {
+fn base_command_for(fixture: &Fixture, cargo_command: &str) -> Command {
     let cargo_home = test_cargo_home(fixture);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cage"));
     command
         .current_dir(fixture.path())
-        .args(["build", "--manifest-path"])
+        .args([cargo_command, "--manifest-path"])
         .arg(fixture.file("Cargo.toml"))
         .env("HOME", fixture.file("fake-home"))
         .env("CARGO_HOME", cargo_home)
@@ -372,6 +425,10 @@ fn base_command(fixture: &Fixture) -> Command {
         .env_remove("CARGO_BUILD_TARGET_DIR");
     apply_rustup_home(&mut command);
     command
+}
+
+fn base_command(fixture: &Fixture) -> Command {
+    base_command_for(fixture, "build")
 }
 
 fn cargo_program() -> OsString {

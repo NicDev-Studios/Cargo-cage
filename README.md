@@ -1,5 +1,12 @@
 # cargo-cage
 
+[![CI](https://github.com/NicDev-Studios/Cargo-cage/actions/workflows/ci.yml/badge.svg)](https://github.com/NicDev-Studios/Cargo-cage/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/NicDev-Studios/Cargo-cage?sort=semver)](https://github.com/NicDev-Studios/Cargo-cage/releases/latest)
+[![Crates.io](https://img.shields.io/crates/v/cargo-cage.svg)](https://crates.io/crates/cargo-cage)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Lines of code](https://sloc.xyz/github/NicDev-Studios/Cargo-cage/?category=code)](https://github.com/NicDev-Studios/Cargo-cage)
+
 `cargo-cage` is an experimental Linux wrapper for Cargo builds. It runs
 Cargo, `build.rs`, procedural macros, compiler helpers, and their child
 processes inside a Bubblewrap sandbox.
@@ -7,7 +14,7 @@ processes inside a Bubblewrap sandbox.
 This is a practical extra boundary around a local build. It is not a complete
 security guarantee and it is not a replacement for a hardened build service.
 
-## What v0.2 does
+## What v0.3 does
 
 - Denies network access by default and forces Cargo offline mode.
 - Mounts the host filesystem read-only.
@@ -26,6 +33,9 @@ security guarantee and it is not a replacement for a hardened build service.
   overlap writable, hidden, or private paths, before starting Cargo.
 - Refuses to run if Bubblewrap is missing, too old, or cannot activate the
   requested namespaces. There is no unsandboxed fallback.
+- Supports `build`, `check`, `test`, and `doc` through the same sandbox policy.
+- Provides `cargo cage doctor` to check the current project and host without
+  creating or changing project files.
 
 ## Requirements and installation
 
@@ -57,7 +67,7 @@ cargo install --path cargo-cage --locked
 Once a crates.io release is available, the CLI can be installed with:
 
 ```sh
-cargo install cargo-cage --locked --version 0.2.0
+cargo install cargo-cage --locked --version 0.3.0
 ```
 
 The repository's crates.io workflow is tag-driven and protected by a GitHub
@@ -81,12 +91,23 @@ Both forms are supported:
 
 ```sh
 cargo cage build
+cargo cage check
+cargo cage test
+cargo cage doc
+cargo cage doctor
 cargo-cage build
+cargo-cage doctor --verbose
 ```
 
-Build arguments are passed through to Cargo. `--target-dir` is accepted only
+Cargo arguments are passed through unchanged. `--target-dir` is accepted only
 when it resolves inside the canonical workspace directory. The same applies
-to `CARGO_TARGET_DIR`.
+to `CARGO_TARGET_DIR`. `run`, `publish`, `fmt`, and arbitrary Cargo commands
+are intentionally not accepted.
+
+`doctor` prints compact `OK`, `WARN`, and `FAIL` lines. A missing target
+directory or cache is not a policy failure; the output explains that Cargo may
+need to create it or that dependencies should be prepared with `cargo fetch`.
+Unsafe paths and a failed Bubblewrap preflight are failures.
 
 ## Before and after
 
@@ -131,7 +152,7 @@ readable.
 
 The path checks are `std`-only and are not race-free against another local
 process changing the filesystem at the same time. Hard-link aliases and
-future filesystem or kernel bugs are outside this MVP's guarantee.
+future filesystem or kernel bugs are outside this release's guarantee.
 
 Artifacts written to `target` are not trusted automatically, and the tool does
 not make their later execution safe. There is no seccomp profile, GUI,

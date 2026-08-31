@@ -10,8 +10,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub use args::{CargoInvocation, help_text, is_help_request, parse_invocation};
-pub use paths::{prepare_lockfile, prepare_target_dir};
+pub use args::{CargoCommand, CargoInvocation, help_text, is_help_request, parse_invocation};
+pub use paths::{inspect_lockfile, prepare_lockfile, prepare_target_dir, validate_target_dir};
 
 /// Run the supported Cargo subcommand through the supplied platform backend.
 pub fn run<I>(args: I, backend: &dyn SandboxBackend) -> CageResult<i32>
@@ -19,42 +19,22 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let invocation = parse_invocation(args)?;
-    let CargoInvocation::Build { args: build_args } = invocation else {
-        return Ok(0);
-    };
+    match invocation {
+        CargoInvocation::Help => Ok(0),
+        CargoInvocation::Doctor { verbose } => run_doctor(verbose, backend),
+        CargoInvocation::Cargo { command, args } => run_cargo(command, args, backend),
+    }
+}
 
-    let current_dir = fs::canonicalize(
-        env::current_dir()
-            .map_err(|error| CageError::io("could not determine the current directory", error))?,
-    )
-    .map_err(|error| CageError::io("could not canonicalize the current directory", error))?;
+fn run_cargo(
+    command: CargoCommand,
+    cargo_args: Vec<OsString>,
+    backend: &dyn SandboxBackend,
+) -> CageResult<i32> {
+    let current_dir = canonical_current_dir()?;
     let cargo = resolve_cargo(&current_dir)?;
-
-    let mut locate_request = SandboxRequest::new(&cargo, &current_dir);
-    locate_request.args.push(OsString::from("locate-project"));
-    locate_request.args.push(OsString::from("--workspace"));
-    locate_request.args.push(OsString::from("--message-format"));
-    locate_request.args.push(OsString::from("plain"));
-    if let Some(manifest_path) = paths::manifest_path_arg(&build_args)? {
-        locate_request.args.push(OsString::from("--manifest-path"));
-        locate_request.args.push(manifest_path);
-    }
-    locate_request.current_dir = current_dir.clone();
-    locate_request.policy = policy::cargo_policy(false)?;
-    locate_request.environment = cargo_environment(Vec::new());
-    locate_request.output = OutputMode::Capture;
-
-    let locate_outcome = backend.run(&locate_request)?;
-    if !locate_outcome.status.successfully_exited() {
-        let detail = output_detail(&locate_outcome.stderr);
-        return Err(CageError::ProcessFailed {
-            status: locate_outcome.status,
-            detail: format!("Cargo workspace discovery failed{detail}"),
-        });
-    }
-
-    let workspace = workspace_from_output(&locate_outcome.stdout, &current_dir)?;
-    let target_dir = paths::target_dir_arg(&build_args, &current_dir, &workspace)?;
+    let workspace = locate_workspace(&cargo, &current_dir, &cargo_args, backend)?;
+    let target_dir = paths::target_dir_arg(&cargo_args, &current_dir, &workspace)?;
     let target_dir = prepare_target_dir(target_dir, &workspace)?;
     let build_dir = prepare_target_dir(target_dir.join("build"), &workspace)?;
     let lockfile = prepare_lockfile(&workspace)?;
@@ -67,12 +47,12 @@ where
     sandbox_policy.writable_paths.push(target_dir.clone());
     sandbox_policy.writable_paths.push(lockfile.clone());
 
-    let mut cargo_args = Vec::with_capacity(build_args.len() + 1);
-    cargo_args.push(OsString::from("build"));
-    cargo_args.extend(build_args);
+    let mut command_args = Vec::with_capacity(cargo_args.len() + 1);
+    command_args.push(OsString::from(command.as_str()));
+    command_args.extend(cargo_args);
 
     let mut request = SandboxRequest::new(&cargo, &current_dir);
-    request.args = cargo_args;
+    request.args = command_args;
     request.policy = sandbox_policy;
     request.environment = cargo_environment(vec![
         (
@@ -94,7 +74,8 @@ where
     }
 
     eprintln!(
-        "cargo-cage: Cargo build failed inside the Linux sandbox (exit code {}).",
+        "cargo-cage: Cargo {} failed inside the Linux sandbox (exit code {}).",
+        command.as_str(),
         outcome
             .status
             .code
@@ -110,6 +91,232 @@ where
     );
 
     Ok(outcome.status.code.unwrap_or(1))
+}
+
+fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
+    println!("cargo-cage doctor");
+    let mut failed = false;
+
+    let current_dir = match canonical_current_dir() {
+        Ok(path) => {
+            println!("  OK   current directory: {}", path.display());
+            path
+        }
+        Err(error) => {
+            println!("  FAIL current directory: {error}");
+            return Ok(1);
+        }
+    };
+
+    let cargo = match resolve_cargo(&current_dir) {
+        Ok(path) => {
+            println!("  OK   Cargo executable: {}", path.display());
+            path
+        }
+        Err(error) => {
+            println!("  FAIL Cargo executable: {error}");
+            return Ok(1);
+        }
+    };
+
+    let workspace = match locate_workspace(&cargo, &current_dir, &[], backend) {
+        Ok(path) => {
+            println!("  OK   workspace: {}", path.display());
+            path
+        }
+        Err(error) => {
+            println!("  FAIL workspace discovery: {error}");
+            return Ok(1);
+        }
+    };
+
+    let target = match paths::target_dir_arg(&[], &current_dir, &workspace) {
+        Ok(path) => match paths::validate_target_dir(&path, &workspace) {
+            Ok(path) => {
+                let exists = fs::symlink_metadata(&path).is_ok();
+                if exists {
+                    println!("  OK   target directory: {}", path.display());
+                } else {
+                    println!(
+                        "  WARN target directory: {} (will be created by the build)",
+                        path.display()
+                    );
+                }
+                Some((path, exists))
+            }
+            Err(error) => {
+                println!("  FAIL target directory: {error}");
+                failed = true;
+                None
+            }
+        },
+        Err(error) => {
+            println!("  FAIL target directory: {error}");
+            failed = true;
+            None
+        }
+    };
+
+    if let Some((target, _)) = target.as_ref() {
+        match paths::validate_target_dir(&target.join("build"), &workspace) {
+            Ok(build_dir) if fs::symlink_metadata(&build_dir).is_ok() => {
+                println!("  OK   target build directory: {}", build_dir.display())
+            }
+            Ok(build_dir) => println!(
+                "  WARN target build directory: {} (will be created by the build)",
+                build_dir.display()
+            ),
+            Err(error) => {
+                println!("  FAIL target build directory: {error}");
+                failed = true;
+            }
+        }
+    }
+
+    let lockfile = workspace.join("Cargo.lock");
+    let lockfile_present = match paths::inspect_lockfile(&workspace) {
+        Ok(true) => {
+            println!("  OK   workspace lockfile: {}", lockfile.display());
+            true
+        }
+        Ok(false) => {
+            println!(
+                "  WARN workspace lockfile: {} (will be created by the build)",
+                lockfile.display()
+            );
+            false
+        }
+        Err(error) => {
+            println!("  FAIL workspace lockfile: {error}");
+            failed = true;
+            false
+        }
+    };
+
+    if cargo_cache_present() {
+        println!("  OK   Cargo registry/Git cache roots are present");
+    } else {
+        println!(
+            "  WARN Cargo registry/Git caches are missing; offline builds may need `cargo fetch`"
+        );
+    }
+
+    println!("  OK   Cargo configuration is intentionally not mounted");
+    println!("  OK   network access denied; persistent writes limited to target and Cargo.lock");
+
+    let policy = match policy::cargo_policy(true) {
+        Ok(mut policy) => {
+            policy.read_only_paths.push(workspace.clone());
+            if current_dir != workspace {
+                policy.read_only_paths.push(current_dir.clone());
+            }
+            if let Some((target, true)) = target.as_ref() {
+                policy.writable_paths.push(target.clone());
+            }
+            if lockfile_present {
+                policy.writable_paths.push(lockfile.clone());
+            }
+            Some(policy)
+        }
+        Err(error) => {
+            println!("  FAIL sandbox policy: {error}");
+            failed = true;
+            None
+        }
+    };
+
+    if let Some(policy) = policy {
+        let mut probe = SandboxRequest::new("/bin/sh", &current_dir);
+        probe.args = vec![OsString::from("-c"), OsString::from("exit 0")];
+        probe.policy = policy;
+        probe.environment = cargo_environment(vec![
+            (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+            (OsString::from("TMPDIR"), OsString::from("/tmp")),
+        ]);
+        probe.output = OutputMode::Capture;
+        match backend.run(&probe) {
+            Ok(outcome) if outcome.status.successfully_exited() => {
+                println!("  OK   Bubblewrap namespaces and sandbox preflight");
+            }
+            Ok(outcome) => {
+                println!(
+                    "  FAIL Bubblewrap sandbox probe: process exited with {:?}",
+                    outcome.status.code
+                );
+                failed = true;
+            }
+            Err(error) => {
+                println!("  FAIL Bubblewrap sandbox probe: {error}");
+                failed = true;
+            }
+        }
+    }
+
+    if verbose {
+        println!("  INFO no automatic dependency fetch is performed");
+        println!("  INFO generated artifacts under target are not trusted automatically");
+        println!("  INFO path checks are not race-free against concurrent host changes");
+    }
+
+    if failed {
+        println!("doctor: one or more checks failed");
+        Ok(1)
+    } else {
+        println!("doctor: environment is ready for an offline sandboxed Cargo command");
+        Ok(0)
+    }
+}
+
+fn canonical_current_dir() -> CageResult<PathBuf> {
+    fs::canonicalize(
+        env::current_dir()
+            .map_err(|error| CageError::io("could not determine the current directory", error))?,
+    )
+    .map_err(|error| CageError::io("could not canonicalize the current directory", error))
+}
+
+fn cargo_cache_present() -> bool {
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    let Some(cargo_home) = cargo_home else {
+        return false;
+    };
+
+    ["registry", "git"].into_iter().any(|name| {
+        fs::symlink_metadata(cargo_home.join(name)).is_ok_and(|metadata| metadata.is_dir())
+    })
+}
+
+fn locate_workspace(
+    cargo: &Path,
+    current_dir: &Path,
+    cargo_args: &[OsString],
+    backend: &dyn SandboxBackend,
+) -> CageResult<PathBuf> {
+    let mut locate_request = SandboxRequest::new(cargo, current_dir);
+    locate_request.args.push(OsString::from("locate-project"));
+    locate_request.args.push(OsString::from("--workspace"));
+    locate_request.args.push(OsString::from("--message-format"));
+    locate_request.args.push(OsString::from("plain"));
+    if let Some(manifest_path) = paths::manifest_path_arg(cargo_args)? {
+        locate_request.args.push(OsString::from("--manifest-path"));
+        locate_request.args.push(manifest_path);
+    }
+    locate_request.policy = policy::cargo_policy(false)?;
+    locate_request.environment = cargo_environment(Vec::new());
+    locate_request.output = OutputMode::Capture;
+
+    let locate_outcome = backend.run(&locate_request)?;
+    if !locate_outcome.status.successfully_exited() {
+        let detail = output_detail(&locate_outcome.stderr);
+        return Err(CageError::ProcessFailed {
+            status: locate_outcome.status,
+            detail: format!("Cargo workspace discovery failed{detail}"),
+        });
+    }
+
+    workspace_from_output(&locate_outcome.stdout, current_dir)
 }
 
 fn cargo_environment(set: Vec<(OsString, OsString)>) -> Environment {
@@ -232,10 +439,14 @@ mod tests {
     use super::*;
     use cage_core::{ProcessStatus, SandboxOutcome};
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
     struct RecordingBackend {
         workspace: PathBuf,
+        second_status: ProcessStatus,
         calls: RefCell<Vec<SandboxRequest>>,
     }
 
@@ -251,7 +462,7 @@ mod tests {
                 })
             } else {
                 Ok(SandboxOutcome {
-                    status: ProcessStatus { code: Some(23) },
+                    status: self.second_status,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
                 })
@@ -267,7 +478,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock after epoch")
                 .as_nanos();
-            let path = env::temp_dir().join(format!("cargo-cage-integration-test-{suffix}"));
+            let id = NEXT_TEST_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!("cargo-cage-integration-test-{suffix}-{id}"));
             fs::create_dir(&path).expect("create test workspace");
             fs::write(
                 path.join("Cargo.toml"),
@@ -292,6 +504,7 @@ mod tests {
         let target = workspace.join("target");
         let backend = RecordingBackend {
             workspace: workspace.clone(),
+            second_status: ProcessStatus { code: Some(23) },
             calls: RefCell::new(Vec::new()),
         };
 
@@ -318,5 +531,78 @@ mod tests {
         assert_eq!(calls[1].args[4], OsString::from("--target-dir"));
         assert_eq!(calls[1].args[5], target.into_os_string());
         assert!(workspace.join("Cargo.lock").is_file());
+    }
+
+    #[test]
+    fn forwards_all_supported_commands_and_returns_exit_codes() {
+        for command in [
+            CargoCommand::Build,
+            CargoCommand::Check,
+            CargoCommand::Test,
+            CargoCommand::Doc,
+        ] {
+            let workspace = TestWorkspace::new();
+            let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+            let manifest = workspace.join("Cargo.toml");
+            let target = workspace.join("target");
+            let backend = RecordingBackend {
+                workspace: workspace.clone(),
+                second_status: ProcessStatus { code: Some(23) },
+                calls: RefCell::new(Vec::new()),
+            };
+
+            let code = run(
+                [
+                    OsString::from(command.as_str()),
+                    OsString::from("--manifest-path"),
+                    manifest.into_os_string(),
+                    OsString::from("--target-dir"),
+                    target.into_os_string(),
+                ],
+                &backend,
+            )
+            .expect("Cargo run result");
+
+            assert_eq!(code, 23);
+            let calls = backend.calls.into_inner();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].args[0], OsString::from(command.as_str()));
+        }
+    }
+
+    #[test]
+    fn doctor_returns_success_when_the_sandbox_probe_succeeds() {
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let backend = RecordingBackend {
+            workspace: workspace.clone(),
+            second_status: ProcessStatus::success(),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let code = run([OsString::from("doctor")], &backend).expect("doctor result");
+
+        assert_eq!(code, 0);
+        assert_eq!(backend.calls.borrow().len(), 2);
+        assert!(!workspace.join("Cargo.lock").exists());
+        assert!(!workspace.join("target").exists());
+    }
+
+    #[test]
+    fn doctor_returns_one_when_the_sandbox_probe_fails() {
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let backend = RecordingBackend {
+            workspace: workspace.clone(),
+            second_status: ProcessStatus { code: Some(23) },
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let code = run([OsString::from("doctor")], &backend).expect("doctor result");
+
+        assert_eq!(code, 1);
+        assert_eq!(backend.calls.borrow().len(), 2);
+        assert!(!workspace.join("Cargo.lock").exists());
+        assert!(!workspace.join("target").exists());
     }
 }

@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "cage-testkit"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "cargo-cage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cage-testkit",
  "cargo-cage-cargo",
@@ -18,18 +18,18 @@ dependencies = [
 
 [[package]]
 name = "cargo-cage-cargo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cargo-cage-core",
 ]
 
 [[package]]
 name = "cargo-cage-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "cargo-cage-linux"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cargo-cage-core",
 ]

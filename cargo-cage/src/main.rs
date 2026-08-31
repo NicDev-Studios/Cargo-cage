@@ -1,21 +1,33 @@
 #![forbid(unsafe_code)]
 
-use cage_cargo::{help_text, is_help_request, run};
+use cage_cargo::{CargoInvocation, help_text, parse_invocation, run};
 use cage_linux::LinuxSandbox;
 use std::env;
 use std::process;
 
 fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    if is_help_request(&args) {
-        print!("{}", help_text());
-        return;
-    }
+    let invocation = match parse_invocation(args.iter().cloned()) {
+        Ok(CargoInvocation::Help) => {
+            print!("{}", help_text());
+            return;
+        }
+        Ok(invocation) => invocation,
+        Err(error) => {
+            eprintln!("cargo-cage: {error}");
+            process::exit(1);
+        }
+    };
+    let doctor = matches!(invocation, CargoInvocation::Doctor { .. });
 
     let backend = match LinuxSandbox::new() {
         Ok(backend) => backend,
         Err(error) => {
-            eprintln!("cargo-cage: {error}");
+            if doctor {
+                eprintln!("cargo-cage doctor: FAIL Bubblewrap/backend: {error}");
+            } else {
+                eprintln!("cargo-cage: {error}");
+            }
             process::exit(1);
         }
     };

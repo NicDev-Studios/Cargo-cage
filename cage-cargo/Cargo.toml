@@ -20,4 +20,4 @@ name = "cage_cargo"
 path = "src/lib.rs"
 
 [dependencies]
-cage-core = { package = "cargo-cage-core", path = "../cage-core", version = "0.2.0" }
+cage-core = { package = "cargo-cage-core", path = "../cage-core", version = "0.3.0" }
