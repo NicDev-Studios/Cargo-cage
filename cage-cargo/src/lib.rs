@@ -105,10 +105,13 @@ fn run_cargo(
     let target_dir = prepare_target_dir(target_dir, &workspace)?;
     let build_dir = prepare_target_dir(target_dir.join("build"), &workspace)?;
     let lockfile = prepare_lockfile(&workspace)?;
+    let sandbox_current_dir = sandbox_current_dir(&current_dir, &workspace, &cargo_args)?;
+    let cargo_args =
+        rewrite_relative_cargo_paths(&cargo_args, &current_dir, &sandbox_current_dir, &target_dir)?;
 
     let mut sandbox_policy = policy::cargo_policy(true)?;
     sandbox_policy.read_only_paths.push(workspace.clone());
-    if current_dir != workspace {
+    if current_dir != workspace && current_dir.starts_with(&workspace) {
         sandbox_policy.read_only_paths.push(current_dir.clone());
     }
     sandbox_policy
@@ -121,12 +124,12 @@ fn run_cargo(
     command_args.push(OsString::from(command.as_str()));
     command_args.extend(cargo_args);
 
-    let mut request = SandboxRequest::new(&toolchain.cargo, &current_dir);
+    let mut request = SandboxRequest::new(&toolchain.cargo, &sandbox_current_dir);
     request.args = command_args;
     request.policy = sandbox_policy;
     request.environment = cargo_environment(
         &toolchain,
-        &current_dir,
+        &sandbox_current_dir,
         vec![
             (
                 OsString::from("CARGO_TARGET_DIR"),
@@ -461,16 +464,9 @@ fn is_safe_environment_name(name: &OsStr) -> bool {
 }
 
 fn manifest_parent_path(args: &[OsString], current_dir: &Path) -> CageResult<Option<PathBuf>> {
-    let Some(value) = paths::manifest_path_arg(args)? else {
+    let Some(manifest) = resolved_manifest_path(args, current_dir)? else {
         return Ok(None);
     };
-    let manifest = PathBuf::from(value);
-    let manifest = if manifest.is_absolute() {
-        manifest
-    } else {
-        current_dir.join(manifest)
-    };
-    let manifest = canonical_existing_path_without_symlinks(&manifest, "manifest path")?;
     if !fs::metadata(&manifest).is_ok_and(|metadata| metadata.is_file()) {
         return Err(CageError::policy(
             manifest.display().to_string(),
@@ -481,6 +477,115 @@ fn manifest_parent_path(args: &[OsString], current_dir: &Path) -> CageResult<Opt
     Ok(manifest.parent().map(Path::to_path_buf))
 }
 
+fn resolved_manifest_path(args: &[OsString], current_dir: &Path) -> CageResult<Option<PathBuf>> {
+    let Some(value) = paths::manifest_path_arg(args)? else {
+        return Ok(None);
+    };
+    let manifest = PathBuf::from(value);
+    let manifest = if manifest.is_absolute() {
+        manifest
+    } else {
+        current_dir.join(manifest)
+    };
+    Ok(Some(canonical_existing_path_without_symlinks(
+        &manifest,
+        "manifest path",
+    )?))
+}
+
+fn sandbox_current_dir(
+    current_dir: &Path,
+    workspace: &Path,
+    cargo_args: &[OsString],
+) -> CageResult<PathBuf> {
+    if current_dir == workspace || current_dir.starts_with(workspace) {
+        return Ok(current_dir.to_path_buf());
+    }
+
+    if let Some(manifest_parent) = manifest_parent_path(cargo_args, current_dir)? {
+        if manifest_parent == workspace || manifest_parent.starts_with(workspace) {
+            return Ok(manifest_parent);
+        }
+    }
+    Ok(workspace.to_path_buf())
+}
+
+fn rewrite_relative_cargo_paths(
+    args: &[OsString],
+    current_dir: &Path,
+    sandbox_current_dir: &Path,
+    target_dir: &Path,
+) -> CageResult<Vec<OsString>> {
+    if current_dir == sandbox_current_dir {
+        return Ok(args.to_vec());
+    }
+
+    let mut rewritten = args.to_vec();
+    let mut index = 0;
+    while index < rewritten.len() {
+        if rewritten[index] == OsStr::new("--") {
+            break;
+        }
+        if rewritten[index] == OsStr::new("--manifest-path") {
+            if let Some(value) = rewritten.get_mut(index + 1) {
+                let path = PathBuf::from(&*value);
+                if !path.is_absolute() {
+                    *value = resolved_manifest_path(args, current_dir)
+                        .and_then(|manifest| {
+                            manifest.ok_or_else(|| {
+                                CageError::InvalidInvocation(
+                                    "--manifest-path needs a value".to_owned(),
+                                )
+                            })
+                        })?
+                        .into_os_string();
+                }
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = rewritten[index]
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("--manifest-path="))
+        {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                let manifest = resolved_manifest_path(args, current_dir)?.ok_or_else(|| {
+                    CageError::InvalidInvocation("--manifest-path needs a value".to_owned())
+                })?;
+                rewritten[index] = OsString::from("--manifest-path=");
+                rewritten[index].push(manifest.into_os_string());
+            }
+        }
+        if rewritten[index] == OsStr::new("--target-dir") {
+            if let Some(value) = rewritten.get_mut(index + 1) {
+                let path = PathBuf::from(&*value);
+                if !path.is_absolute() {
+                    *value = target_dir.as_os_str().to_os_string();
+                }
+            }
+            index += 2;
+            continue;
+        }
+        if rewritten[index]
+            .to_str()
+            .is_some_and(|arg| arg.starts_with("--target-dir=") && arg.len() > 13)
+        {
+            let value = rewritten[index]
+                .to_str()
+                .expect("checked UTF-8 target-dir argument")
+                .strip_prefix("--target-dir=")
+                .expect("checked target-dir argument");
+            if !Path::new(value).is_absolute() {
+                rewritten[index] = OsString::from("--target-dir=");
+                rewritten[index].push(target_dir.as_os_str());
+            }
+        }
+        index += 1;
+    }
+    Ok(rewritten)
+}
+
 fn resolve_toolchain(
     cargo: &Path,
     current_dir: &Path,
@@ -488,10 +593,11 @@ fn resolve_toolchain(
 ) -> CageResult<Toolchain> {
     let home = canonical_home()?;
     let host_rustc = resolve_program("rustc", "RUSTC", current_dir)?;
-    let sysroot = query_sysroot(&host_rustc, &home)?;
+    let rustc_for_toolchain = resolve_rustup_rustc(&host_rustc, &home, current_dir)?;
+    let sysroot = query_sysroot(&rustc_for_toolchain, &home, current_dir)?;
     let sysroot_bin = sysroot.join("bin");
 
-    let rustc = select_toolchain_program("rustc", &host_rustc, &sysroot_bin, true)?;
+    let rustc = select_toolchain_program("rustc", &rustc_for_toolchain, &sysroot_bin, true)?;
     let rustdoc = if sysroot_bin.join("rustdoc").is_file() {
         Some(select_toolchain_program(
             "rustdoc",
@@ -527,7 +633,7 @@ fn resolve_toolchain(
         [&cargo, &rustc].into_iter().chain(rustdoc.as_ref()),
     )?;
     for directory in path_directories {
-        if !read_only_paths.contains(&directory) {
+        if !is_standard_runtime_path(&directory) && !read_only_paths.contains(&directory) {
             read_only_paths.push(directory);
         }
     }
@@ -601,11 +707,116 @@ fn select_toolchain_program(
     }
 }
 
-fn query_sysroot(rustc: &Path, home: &Path) -> CageResult<PathBuf> {
+fn resolve_rustup_rustc(host_rustc: &Path, home: &Path, current_dir: &Path) -> CageResult<PathBuf> {
+    if !is_rustup_proxy(host_rustc) {
+        return Ok(host_rustc.to_path_buf());
+    }
+
+    let rustup = fs::canonicalize(host_rustc).map_err(|error| {
+        CageError::io(
+            format!(
+                "could not resolve the rustup executable {}",
+                host_rustc.display()
+            ),
+            error,
+        )
+    })?;
+    let rustup_home = canonical_rustup_home(home)?;
+    let mut command = Command::new(&rustup);
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .current_dir(current_dir)
+        .args(["which", "rustc"]);
+    if let Some(rustup_toolchain) = env::var_os("RUSTUP_TOOLCHAIN") {
+        command.env("RUSTUP_TOOLCHAIN", rustup_toolchain);
+    }
+    let output = command.output().map_err(|source| CageError::ProcessSpawn {
+        program: rustup.clone(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CageError::BackendUnavailable(format!(
+            "rustup could not resolve a preinstalled rustc{}; install the selected toolchain before running cargo-cage",
+            output_detail(&output.stderr),
+        )));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text.trim();
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        return Err(CageError::BackendUnavailable(
+            "rustup returned an invalid rustc path; select a preinstalled Rust toolchain"
+                .to_owned(),
+        ));
+    }
+    let compiler =
+        canonical_existing_path_without_symlinks(Path::new(value), "Rustup-selected rustc")?;
+    if !fs::metadata(&compiler).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(CageError::policy(
+            compiler.display().to_string(),
+            "the Rustup-selected compiler must be a regular file",
+            "install a complete preinstalled Rust toolchain and retry",
+        ));
+    }
+    let toolchains = rustup_home.join("toolchains");
+    if !is_trusted_rustup_compiler(&compiler, &toolchains) {
+        return Err(CageError::policy(
+            compiler.display().to_string(),
+            "a project Rust toolchain must resolve inside the trusted Rustup toolchains or system runtime",
+            "remove the project path override and select an installed toolchain under RUSTUP_HOME",
+        ));
+    }
+    Ok(compiler)
+}
+
+fn canonical_rustup_home(home: &Path) -> CageResult<PathBuf> {
+    let rustup_home = env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".rustup"));
+    if !rustup_home.is_absolute() {
+        return Err(CageError::policy(
+            rustup_home.display().to_string(),
+            "RUSTUP_HOME must be an absolute path",
+            "set RUSTUP_HOME to the absolute path of a real Rustup directory",
+        ));
+    }
+    if rustup_home == Path::new(std::path::MAIN_SEPARATOR_STR) {
+        return Err(CageError::policy(
+            rustup_home.display().to_string(),
+            "RUSTUP_HOME must not be the filesystem root",
+            "set RUSTUP_HOME to a real Rustup directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&rustup_home).map_err(|error| {
+        CageError::io(
+            format!("could not inspect Rustup home {}", rustup_home.display()),
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CageError::policy(
+            rustup_home.display().to_string(),
+            "RUSTUP_HOME must be an existing real directory without symlink resolution",
+            "set RUSTUP_HOME to an existing real Rustup directory",
+        ));
+    }
+    canonical_existing_path_without_symlinks(&rustup_home, "Rustup home")
+}
+
+fn is_trusted_rustup_compiler(path: &Path, toolchains: &Path) -> bool {
+    is_standard_runtime_path(path) || path.starts_with(toolchains)
+}
+
+fn query_sysroot(rustc: &Path, home: &Path, current_dir: &Path) -> CageResult<PathBuf> {
     let mut command = Command::new(rustc);
     command
         .env_clear()
         .env("HOME", home)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .current_dir(current_dir)
         .args(["--print", "sysroot"]);
     if let Some(rustup_home) = env::var_os("RUSTUP_HOME") {
         command.env("RUSTUP_HOME", rustup_home);
@@ -687,7 +898,10 @@ where
                 parent.display()
             )));
         }
-        if parent != Path::new(std::path::MAIN_SEPARATOR_STR) && !paths.contains(&parent) {
+        if parent != Path::new(std::path::MAIN_SEPARATOR_STR)
+            && !is_standard_runtime_path(&parent)
+            && !paths.contains(&parent)
+        {
             paths.push(parent);
         }
     }
@@ -1087,6 +1301,42 @@ mod tests {
     }
 
     #[test]
+    fn narrows_external_working_directory_and_rewrites_relative_paths() {
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let current_dir = workspace.parent().expect("workspace parent");
+        let relative_workspace = PathBuf::from(workspace.file_name().expect("workspace name"));
+        let relative_manifest = relative_workspace.join("Cargo.toml");
+        let relative_target = relative_workspace.join("target");
+        let sandbox_dir = sandbox_current_dir(
+            current_dir,
+            &workspace,
+            &[
+                OsString::from("--manifest-path"),
+                relative_manifest.clone().into_os_string(),
+            ],
+        )
+        .expect("safe sandbox working directory");
+        assert_eq!(sandbox_dir, workspace);
+
+        let target = workspace.join("target");
+        let rewritten = rewrite_relative_cargo_paths(
+            &[
+                OsString::from("--manifest-path"),
+                relative_manifest.into_os_string(),
+                OsString::from("--target-dir"),
+                relative_target.into_os_string(),
+            ],
+            current_dir,
+            &sandbox_dir,
+            &target,
+        )
+        .expect("rewrite safe relative paths");
+        assert_eq!(rewritten[1], workspace.join("Cargo.toml").into_os_string());
+        assert_eq!(rewritten[3], target.into_os_string());
+    }
+
+    #[test]
     fn doctor_returns_success_when_the_sandbox_probe_succeeds() {
         let workspace = TestWorkspace::new();
         let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
@@ -1209,6 +1459,19 @@ mod tests {
         assert!(is_standard_runtime_path(Path::new("/usr/bin")));
         assert!(is_standard_runtime_path(Path::new("/usr/local/bin/tool")));
         assert!(!is_standard_runtime_path(Path::new("/opt/custom-bin")));
+    }
+
+    #[test]
+    fn rejects_project_owned_rustup_compilers() {
+        let toolchains = Path::new("/home/test/.rustup/toolchains");
+        assert!(is_trusted_rustup_compiler(
+            Path::new("/home/test/.rustup/toolchains/stable/bin/rustc"),
+            toolchains
+        ));
+        assert!(!is_trusted_rustup_compiler(
+            Path::new("/workspace/toolchain/bin/rustc"),
+            toolchains
+        ));
     }
 
     #[cfg(unix)]

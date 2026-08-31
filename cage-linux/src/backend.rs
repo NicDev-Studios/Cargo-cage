@@ -2,6 +2,8 @@ use cage_core::{CageError, CageResult, SandboxBackend, SandboxOutcome, SandboxRe
 #[cfg(target_os = "linux")]
 use cage_core::{Environment, NetworkAccess, OutputMode, ProcessStatus};
 #[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
@@ -30,30 +32,45 @@ const CARGO_HOME_IN_SANDBOX: &str = "/run/cargo-cage-home";
 const NAMESPACE_PREFLIGHT_OUTPUT: &[u8] = b"cargo-cage-namespace-preflight-ok\n";
 #[cfg(target_os = "linux")]
 const NAMESPACE_PREFLIGHT: &str = r#"set -eu
-[ -x /usr/bin/readlink ]
-[ -x /usr/bin/grep ]
-[ -x /usr/bin/ps ]
-[ -x /usr/bin/tr ]
-mnt=$(/usr/bin/readlink /proc/self/ns/mnt)
-user=$(/usr/bin/readlink /proc/self/ns/user)
-pid=$(/usr/bin/readlink /proc/self/ns/pid)
-ipc=$(/usr/bin/readlink /proc/self/ns/ipc)
-uts=$(/usr/bin/readlink /proc/self/ns/uts)
-net=$(/usr/bin/readlink /proc/self/ns/net)
-[ -n "$mnt" ] && [ "$mnt" != "$1" ]
-[ -n "$user" ] && [ "$user" != "$2" ]
-[ -n "$pid" ] && [ "$pid" != "$3" ]
-[ -n "$ipc" ] && [ "$ipc" != "$4" ]
-[ -n "$uts" ] && [ "$uts" != "$5" ]
+fail() {
+  printf 'cargo-cage preflight check failed: %s\n' "$1" >&2
+  exit 1
+}
+[ -x /usr/bin/readlink ] || fail "readlink is unavailable"
+[ -x /usr/bin/grep ] || fail "grep is unavailable"
+[ -x /usr/bin/ps ] || fail "ps is unavailable"
+[ -x /usr/bin/tr ] || fail "tr is unavailable"
+mnt=$(/usr/bin/readlink /proc/self/ns/mnt) || fail "mount namespace cannot be inspected"
+user=$(/usr/bin/readlink /proc/self/ns/user) || fail "user namespace cannot be inspected"
+pid=$(/usr/bin/readlink /proc/self/ns/pid) || fail "PID namespace cannot be inspected"
+ipc=$(/usr/bin/readlink /proc/self/ns/ipc) || fail "IPC namespace cannot be inspected"
+uts=$(/usr/bin/readlink /proc/self/ns/uts) || fail "UTS namespace cannot be inspected"
+net=$(/usr/bin/readlink /proc/self/ns/net) || fail "network namespace cannot be inspected"
+[ -n "$mnt" ] && [ "$mnt" != "$1" ] || fail "mount namespace was not isolated"
+[ -n "$user" ] && [ "$user" != "$2" ] || fail "user namespace was not isolated"
+[ -n "$pid" ] && [ "$pid" != "$3" ] || fail "PID namespace was not isolated"
+[ -n "$ipc" ] && [ "$ipc" != "$4" ] || fail "IPC namespace was not isolated"
+[ -n "$uts" ] && [ "$uts" != "$5" ] || fail "UTS namespace was not isolated"
 if [ -n "${6:-}" ]; then
-  [ -n "$net" ] && [ "$net" != "$6" ]
+  [ -n "$net" ] && [ "$net" != "$6" ] || fail "network namespace was not isolated"
 fi
 for capability in CapEff CapPrm CapInh CapBnd CapAmb; do
-  /usr/bin/grep -Eq "^${capability}:[[:space:]]+0+$" /proc/self/status
+  /usr/bin/grep -Eq "^${capability}:[[:space:]]+0+$" /proc/self/status \
+    || fail "$capability is not empty"
 done
-/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
-session=$(/usr/bin/ps -o sid= -p $$ | /usr/bin/tr -d '[:space:]')
-[ "$session" = "$$" ]
+/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status \
+  || fail "NoNewPrivs is not enabled"
+session=$(/usr/bin/ps -o sid= -p $$ | /usr/bin/tr -d '[:space:]') \
+  || fail "session ID cannot be inspected"
+parent_session="$7"
+[ -n "$session" ] && [ -n "$parent_session" ] \
+  || fail "session IDs are unavailable"
+[ "$session" != "$parent_session" ] \
+  || fail "sandbox kept the parent session"
+session_leader=$(/usr/bin/ps -o sid= -p 1 | /usr/bin/tr -d '[:space:]') \
+  || fail "sandbox session leader cannot be inspected"
+[ "$session" = "$session_leader" ] \
+  || fail "sandbox command is not in Bubblewrap's new session"
 printf '%s\n' cargo-cage-namespace-preflight-ok
 "#;
 
@@ -95,6 +112,7 @@ impl LinuxSandbox {
         args: &[OsString],
         output_mode: OutputMode,
     ) -> CageResult<SandboxOutcome> {
+        reject_inherited_file_descriptors()?;
         let mut command = Command::new(&self.bwrap);
         command.args(build_bwrap_args(plan, program, args));
         command.current_dir(&plan.current_dir);
@@ -223,14 +241,7 @@ impl SandboxPlan {
             .read_only_paths
             .iter()
             .map(|path| canonical_existing_dir(path, "read-only path"))
-            .collect::<CageResult<Vec<_>>>()?
-            .into_iter()
-            .filter(|path| {
-                !runtime_mounts
-                    .iter()
-                    .any(|mount| path == &mount.destination || path.starts_with(&mount.destination))
-            })
-            .collect::<Vec<_>>();
+            .collect::<CageResult<Vec<_>>>()?;
         let mut private_paths = request
             .policy
             .private_paths
@@ -298,6 +309,9 @@ impl SandboxPlan {
         )?;
         for path in &writable_paths {
             validate_writable_tree(path)?;
+        }
+        for path in unique_mount_roots(&read_only_paths) {
+            validate_read_only_tree(path, &writable_paths)?;
         }
         let cargo_cache_paths = cargo_home
             .as_deref()
@@ -657,6 +671,36 @@ where
 }
 
 #[cfg(target_os = "linux")]
+fn reject_inherited_file_descriptors() -> CageResult<()> {
+    let entries = fs::read_dir("/proc/self/fd").map_err(|error| {
+        CageError::io(
+            "could not inspect inherited file descriptors; close non-stdio descriptors before retrying",
+            error,
+        )
+    })?;
+    let descriptors = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| name.parse::<u32>().ok())
+        .filter(|descriptor| *descriptor >= 3)
+        .collect::<Vec<_>>();
+
+    // The directory iterator itself briefly owns a descriptor. Inspect the
+    // candidates after dropping the iterator so that temporary scan state is
+    // not mistaken for a caller-owned descriptor.
+    for descriptor in descriptors {
+        if fs::read_link(format!("/proc/self/fd/{descriptor}")).is_ok() {
+            return Err(CageError::policy(
+                format!("file descriptor {descriptor}"),
+                "inherited file descriptors >= 3 are not passed into the sandbox",
+                "close the descriptor or start cargo-cage with only standard stdio open",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn merged_environment(request: &SandboxRequest) -> Environment {
     let mut remove = request.environment.remove.clone();
     for key in &request.policy.remove_environment {
@@ -718,7 +762,7 @@ fn is_protected_environment_name(name: &OsString) -> bool {
 
 #[cfg(target_os = "linux")]
 fn parent_namespace_markers() -> CageResult<Vec<OsString>> {
-    ["mnt", "user", "pid", "ipc", "uts", "net"]
+    let mut markers = ["mnt", "user", "pid", "ipc", "uts", "net"]
         .into_iter()
         .map(|name| {
             fs::read_link(format!("/proc/self/ns/{name}"))
@@ -730,7 +774,35 @@ fn parent_namespace_markers() -> CageResult<Vec<OsString>> {
                     )
                 })
         })
-        .collect()
+        .collect::<CageResult<Vec<_>>>()?;
+    markers.push(parent_session_marker()?);
+    Ok(markers)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_session_marker() -> CageResult<OsString> {
+    let pid = std::process::id().to_string();
+    let output = Command::new("/usr/bin/ps")
+        .env_clear()
+        .args(["-o", "sid=", "-p", &pid])
+        .output()
+        .map_err(|source| CageError::ProcessSpawn {
+            program: PathBuf::from("/usr/bin/ps"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(CageError::SandboxSetup(
+            "could not determine the parent session ID; install procps and retry".to_owned(),
+        ));
+    }
+    let marker = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if marker.is_empty() || !marker.chars().all(|character| character.is_ascii_digit()) {
+        return Err(CageError::SandboxSetup(
+            "the parent session ID was invalid; install a working procps package and retry"
+                .to_owned(),
+        ));
+    }
+    Ok(marker.into())
 }
 
 #[cfg(target_os = "linux")]
@@ -865,123 +937,258 @@ fn validate_cache_source_policy(
 
 #[cfg(target_os = "linux")]
 fn validate_cache_tree(root: &Path) -> CageResult<()> {
-    let mut directories = vec![root.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        let entries = fs::read_dir(&directory).map_err(|error| {
-            CageError::io(
-                format!("could not inspect Cargo cache {}", directory.display()),
-                error,
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                CageError::io(
-                    format!("could not inspect Cargo cache {}", directory.display()),
-                    error,
-                )
-            })?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|error| {
-                CageError::io(
-                    format!("could not inspect Cargo cache entry {}", path.display()),
-                    error,
-                )
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(CageError::policy(
-                    path.display().to_string(),
-                    "mounted Cargo caches must not contain symlinks",
-                    "remove the symlink or run cargo fetch in a clean Cargo home",
-                ));
-            }
-            if metadata.is_dir() {
-                directories.push(path);
-            } else if !metadata.is_file() {
-                return Err(CageError::policy(
-                    path.display().to_string(),
-                    "mounted Cargo caches may contain only regular files and directories",
-                    "remove the special file before running cargo-cage",
-                ));
-            }
-        }
-    }
-    Ok(())
+    validate_tree(root, TreeKind::Cache, &[])
 }
 
 #[cfg(target_os = "linux")]
 fn validate_writable_tree(root: &Path) -> CageResult<()> {
+    validate_tree(root, TreeKind::Writable, &[])
+}
+
+#[cfg(target_os = "linux")]
+fn validate_read_only_tree(root: &Path, excluded_paths: &[PathBuf]) -> CageResult<()> {
+    validate_tree(root, TreeKind::ReadOnly, excluded_paths)
+}
+
+#[cfg(target_os = "linux")]
+fn unique_mount_roots(paths: &[PathBuf]) -> Vec<&PathBuf> {
+    let mut sorted = paths.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|path| path.components().count());
+    let mut roots = Vec::new();
+    for path in sorted {
+        if !roots.iter().any(|root| path.starts_with(root)) {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum TreeKind {
+    Cache,
+    ReadOnly,
+    Writable,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_tree(root: &Path, kind: TreeKind, excluded_paths: &[PathBuf]) -> CageResult<()> {
     let metadata = fs::symlink_metadata(root).map_err(|error| {
         CageError::io(
-            format!("could not inspect writable path {}", root.display()),
+            format!("could not inspect {} {}", tree_label(kind), root.display()),
             error,
         )
     })?;
     if metadata.file_type().is_symlink() {
         return Err(CageError::policy(
             root.display().to_string(),
-            "writable mount roots and entries must not be symlinks",
-            "remove the symlink from the target or lockfile path and retry",
+            format!("{} roots must not be symlinks", tree_label(kind)),
+            "replace the symlink with a real path before running cargo-cage",
         ));
     }
     if metadata.is_file() {
-        if metadata.nlink() > 1 {
-            return Err(CageError::policy(
-                root.display().to_string(),
-                "a writable file must not be a hardlink to another host file",
-                "replace the file with a single-link file before running cargo-cage",
-            ));
+        if matches!(kind, TreeKind::Writable) {
+            let files = vec![(root.to_path_buf(), metadata)];
+            return validate_hardlink_aliases(&files, tree_label(kind));
         }
-        return Ok(());
+        return Err(CageError::policy(
+            root.display().to_string(),
+            format!("{} roots must be directories", tree_label(kind)),
+            "replace the file with a real directory before running cargo-cage",
+        ));
     }
     if !metadata.is_dir() {
         return Err(CageError::policy(
             root.display().to_string(),
-            "writable mounts may contain only regular files and directories",
+            format!(
+                "{} trees may contain only regular files and directories",
+                tree_label(kind)
+            ),
             "remove the special file before running cargo-cage",
         ));
     }
 
+    validate_no_nested_mounts(root, tree_label(kind))?;
     let mut directories = vec![root.to_path_buf()];
+    let mut files = Vec::new();
     while let Some(directory) = directories.pop() {
         let entries = fs::read_dir(&directory).map_err(|error| {
             CageError::io(
-                format!("could not inspect writable path {}", directory.display()),
+                format!(
+                    "could not inspect {} {}",
+                    tree_label(kind),
+                    directory.display()
+                ),
                 error,
             )
         })?;
         for entry in entries {
             let entry = entry.map_err(|error| {
                 CageError::io(
-                    format!("could not inspect writable path {}", directory.display()),
+                    format!(
+                        "could not inspect {} {}",
+                        tree_label(kind),
+                        directory.display()
+                    ),
                     error,
                 )
             })?;
             let path = entry.path();
+            if excluded_paths
+                .iter()
+                .any(|excluded| path == *excluded || path.starts_with(excluded))
+            {
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path).map_err(|error| {
                 CageError::io(
-                    format!("could not inspect writable path entry {}", path.display()),
+                    format!(
+                        "could not inspect {} entry {}",
+                        tree_label(kind),
+                        path.display()
+                    ),
                     error,
                 )
             })?;
             if metadata.file_type().is_symlink() {
+                if matches!(kind, TreeKind::ReadOnly) {
+                    let resolved = fs::canonicalize(&path).map_err(|error| {
+                        CageError::io(
+                            format!("could not resolve read-only symlink {}", path.display()),
+                            error,
+                        )
+                    })?;
+                    if !resolved.starts_with(root) {
+                        return Err(CageError::policy(
+                            path.display().to_string(),
+                            "read-only tree symlinks must resolve inside the validated tree",
+                            "replace the external symlink with a real file or an in-tree link",
+                        ));
+                    }
+                    continue;
+                }
                 return Err(CageError::policy(
                     path.display().to_string(),
-                    "writable mount trees must not contain symlinks",
-                    "remove the symlink from the target tree before running cargo-cage",
+                    format!("{} trees must not contain symlinks", tree_label(kind)),
+                    "remove the symlink before running cargo-cage",
                 ));
             }
             if metadata.is_dir() {
                 directories.push(path);
-            } else if !metadata.is_file() {
+            } else if metadata.is_file() {
+                files.push((path, metadata));
+            } else {
                 return Err(CageError::policy(
                     path.display().to_string(),
-                    "writable mount trees may contain only regular files and directories",
+                    format!(
+                        "{} trees may contain only regular files and directories",
+                        tree_label(kind)
+                    ),
                     "remove the special file before running cargo-cage",
                 ));
             }
         }
     }
+
+    validate_hardlink_aliases(&files, tree_label(kind))
+}
+
+#[cfg(target_os = "linux")]
+fn tree_label(kind: TreeKind) -> &'static str {
+    match kind {
+        TreeKind::Cache => "Cargo cache",
+        TreeKind::ReadOnly => "read-only",
+        TreeKind::Writable => "writable",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_hardlink_aliases(files: &[(PathBuf, fs::Metadata)], label: &str) -> CageResult<()> {
+    let mut counts = HashMap::new();
+    for (_, metadata) in files {
+        let identity = (metadata.dev(), metadata.ino());
+        *counts.entry(identity).or_insert(0_u64) += 1;
+    }
+    for (path, metadata) in files {
+        let identity = (metadata.dev(), metadata.ino());
+        if metadata.nlink() != counts[&identity] {
+            return Err(CageError::policy(
+                path.display().to_string(),
+                format!("{label} contains a hardlink with an alias outside the validated tree"),
+                "replace the hardlink with a copied regular file inside the validated tree",
+            ));
+        }
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_no_nested_mounts(root: &Path, label: &str) -> CageResult<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    if !Path::new("/proc/self/mountinfo").exists() {
+        // Linux-only code is also compiled under a forced cfg on macOS in
+        // local CI checks. A real Linux run must always have procfs because
+        // the namespace preflight depends on it as well.
+        return Ok(());
+    }
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").map_err(|error| {
+        CageError::io(
+            format!("could not inspect mountpoints below {}", root.display()),
+            error,
+        )
+    })?;
+    for line in mountinfo.lines().filter(|line| !line.is_empty()) {
+        let mountpoint = line.split_whitespace().nth(4).ok_or_else(|| {
+            CageError::policy(
+                root.display().to_string(),
+                "the host mount table could not be parsed while validating a protected tree",
+                "retry on a Linux host with a readable /proc/self/mountinfo",
+            )
+        })?;
+        let mountpoint = decode_mountinfo_path(mountpoint).ok_or_else(|| {
+            CageError::policy(
+                root.display().to_string(),
+                "the host mount table contained an invalid protected-tree path",
+                "retry after removing invalid mountpoint metadata",
+            )
+        })?;
+        if mountpoint != root && mountpoint.starts_with(root) {
+            return Err(CageError::policy(
+                mountpoint.display().to_string(),
+                format!("{label} trees must not contain nested mountpoints"),
+                "unmount the nested filesystem before running cargo-cage",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(encoded: &str) -> Option<PathBuf> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 3 >= bytes.len() {
+                return None;
+            }
+            let mut value = 0_u8;
+            for offset in 1..=3 {
+                let digit = bytes[index + offset];
+                if !(b'0'..=b'7').contains(&digit) {
+                    return None;
+                }
+                value = value * 8 + digit - b'0';
+            }
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok().map(PathBuf::from)
 }
 
 #[cfg(target_os = "linux")]
@@ -1283,6 +1490,7 @@ fn validate_bwrap_path(path: PathBuf) -> CageResult<PathBuf> {
 #[cfg(target_os = "linux")]
 fn bwrap_version(path: &Path) -> CageResult<(u32, u32, u32)> {
     let output = Command::new(path)
+        .env_clear()
         .arg("--version")
         .output()
         .map_err(|source| CageError::ProcessSpawn {
@@ -1513,7 +1721,8 @@ mod tests {
         assert!(NAMESPACE_PREFLIGHT.contains("NoNewPrivs"));
         assert!(NAMESPACE_PREFLIGHT.contains("CapEff"));
         assert!(NAMESPACE_PREFLIGHT.contains("CapBnd"));
-        assert!(NAMESPACE_PREFLIGHT.contains("session=$"));
+        assert!(NAMESPACE_PREFLIGHT.contains("parent_session=\"$7\""));
+        assert!(NAMESPACE_PREFLIGHT.contains("session_leader="));
 
         let allow_plan = SandboxPlan {
             network: NetworkAccess::Allow,
@@ -1657,9 +1866,57 @@ mod tests {
         let error =
             validate_cargo_cache_paths(&cargo_home, &[], &[]).expect_err("nested symlink cache");
         let text = error.to_string();
-        assert!(text.contains("mounted Cargo caches"), "{text}");
+        assert!(text.contains("Cargo cache"), "{text}");
         assert!(text.contains("symlink"), "{text}");
         assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hardlink_alias_outside_validated_tree() {
+        let root = TestDirectory::new();
+        let inside = root.path().join("inside");
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"secret").expect("write external file");
+        fs::hard_link(&outside, &inside).expect("create external hardlink");
+
+        let files = vec![(
+            inside.clone(),
+            fs::metadata(&inside).expect("inside metadata"),
+        )];
+        let error = validate_hardlink_aliases(&files, "read-only").expect_err("external alias");
+        let text = error.to_string();
+        assert!(text.contains("hardlink"), "{text}");
+        assert!(text.contains(&inside.display().to_string()), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_hardlink_aliases_inside_validated_tree() {
+        let root = TestDirectory::new();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"internal").expect("write internal file");
+        fs::hard_link(&first, &second).expect("create internal hardlink");
+
+        let files = vec![
+            (first.clone(), fs::metadata(&first).expect("first metadata")),
+            (
+                second.clone(),
+                fs::metadata(&second).expect("second metadata"),
+            ),
+        ];
+        validate_hardlink_aliases(&files, "writable").expect("internal aliases are safe");
+    }
+
+    #[test]
+    fn decodes_mountinfo_escaped_paths() {
+        assert_eq!(
+            decode_mountinfo_path("/tmp/path\\040with\\011escapes"),
+            Some(PathBuf::from("/tmp/path with\tescapes"))
+        );
+        assert_eq!(decode_mountinfo_path("/tmp/invalid\\08"), None);
     }
 
     #[cfg(unix)]

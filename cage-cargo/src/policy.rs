@@ -30,7 +30,7 @@ pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| default_cargo_home.clone());
-    let mut hidden_paths = Vec::new();
+    let mut hidden_paths = vec![PathBuf::from("/etc/cargo")];
     for name in [
         ".ssh",
         ".aws",

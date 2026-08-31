@@ -1,69 +1,92 @@
 # Security
 
-`cargo-cage` is experimental software. The current 0.3 package is an
-additional guard around local Cargo operations; the v0.4 hardening work is not
-released yet. This is not a complete sandbox and is not a promise that a
-malicious build cannot escape.
+Let's be direct: `cargo-cage` is experimental. It adds a useful Linux
+boundary around Cargo, but it is not a complete sandbox and it does not come
+with a promise that hostile code can never escape. If you need a hard,
+independent trust boundary, use a VM or a dedicated build service as well.
 
-The intended boundary, trust assumptions, and residual risk are documented in
+The intended boundary and the assumptions behind it live in
 [THREAT_MODEL.md](THREAT_MODEL.md).
 
 ## Supported platform
 
-The supported reference platform is Ubuntu 24.04 x86_64 with Bubblewrap 0.12.0 or
+The reference platform is Ubuntu 24.04 x86_64 with Bubblewrap `0.12.0` or
 newer, unprivileged user namespaces enabled, and a host AppArmor policy that
-allows Bubblewrap to perform its setup. Other Linux distributions may work,
-but are not the reference environment. macOS and Windows are not supported.
-Bubblewrap versions below 0.12.0 are rejected because of the upstream
+allows Bubblewrap to set up those namespaces. Other Linux distributions may
+work, but they are experimental. macOS and Windows are not supported.
+
+Bubblewrap versions below `0.12.0` are rejected because they are outside the
+supported baseline after the upstream
 [GHSA-pxhw-h44j-8pfx setup vulnerability](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx).
 
-## Security properties
+## What we actually enforce
 
-The Linux backend uses read-only runtime/project mounts, private temporary and
-runtime filesystems (`/tmp`, `/var/tmp`, and `/run`), a new network namespace,
-dropped capabilities, and a parent-death guard. Persistent writes are limited
-to the canonical build target and workspace lockfile.
+The Linux backend mounts a small read-only runtime, the workspace, checked
+toolchain paths, and checked Cargo caches. The host root is not mounted as one
+giant read-only tree. `target` and the workspace `Cargo.lock` are the only
+persistent writable locations. `/tmp`, `/var/tmp`, and `/run` are private.
 
-The child starts with an empty environment. Only a fixed, reviewed set of
-Cargo/Rust, compiler, locale, and terminal variables is copied. `HOME` is
-private, and `PATH` is rebuilt from the selected toolchain and existing helper
-directories. Credentials, agent variables, `CARGO_HOME`, `RUSTUP_HOME`, and
-arbitrary project variables are not inherited.
+Network access is denied twice: Bubblewrap gets a separate network namespace,
+and Cargo is forced into offline mode. There is no automatic fetch.
 
-Cargo runs with a private `CARGO_HOME`; only validated registry and Git caches
-are exposed read-only. Cache roots must be real, absolute directories and
-their trees may contain only regular files and directories. User Cargo
-configuration is deliberately not mounted because it may contain credentials.
-That refers to user/global Cargo configuration; a project-local config inside
-the read-only workspace remains visible as project input.
-`build`, `check`, `test`, and `doc` use the same policy; `test` binaries,
-procedural macros, compiler helpers, linkers, and their child processes remain
-inside the sandbox.
+The child starts with an empty environment. A fixed allowlist supplies the
+Cargo/Rust, compiler, locale, and terminal values needed for normal builds.
+Credentials, agent variables, `CARGO_HOME`, `RUSTUP_HOME`, and arbitrary host
+variables do not cross the boundary. Policy removals win over later
+environment values.
 
-`cargo cage doctor` performs the same host, workspace, path, cache, and
-Bubblewrap preflight checks without creating a target directory or lockfile.
+Cargo gets a private `CARGO_HOME`. Only existing `registry` and `git` caches
+are considered, and only after their roots and contents pass validation.
+User/global Cargo config and credentials are intentionally not mounted. A
+project-local `.cargo/config.toml` is still part of the workspace input; it is
+not a trust signal.
 
-These controls are defense-in-depth. They depend on the Linux kernel,
-Bubblewrap, Cargo, Rustc, the host security policy, and the selected toolchain
-behaving correctly. There is no Seccomp, Landlock, resource limit, or
-race-free path guarantee in this release. `Cargo.lock` hard-links are rejected,
-but hard-link aliases inside Cargo's target tree remain a known limitation.
-Selected system runtime and project paths can still be read, so this is not
-complete secret scrubbing. Artifacts written to `target` are not made safe to
-execute automatically.
+Before mounting, the backend checks paths, types, overlaps, and canonical
+resolution. Nested mountpoints, sockets, device nodes, FIFOs, external
+symlinks, and hardlink aliases leaving a validated tree stop the operation.
+Hardlinks Cargo keeps entirely inside `target` remain usable.
+
+The selected Rustup compiler is resolved before execution. Project path
+overrides outside trusted Rustup toolchains or the system runtime are rejected,
+and missing toolchains are not installed automatically. Child processes,
+procedural macros, test binaries, linkers, and compiler helpers inherit the
+same Bubblewrap boundary.
+
+There is no unsandboxed fallback. If Bubblewrap is absent, too old, not
+executable, or cannot complete its preflight, the build stops.
+
+## The invocation trap
+
+Use `cargo-cage build`, not `cargo cage build`, when this boundary matters.
+Cargo processes `[alias]` entries before it launches external subcommands. A
+workspace can define an alias named `cage`, and then Cargo may never launch
+`cargo-cage` at all. No code in this repository can detect a process that was
+never started. This is a Cargo dispatcher limitation, not a Bubblewrap escape.
+Cargo is tracking the upstream fix in
+[issue #10049](https://github.com/rust-lang/cargo/issues/10049).
 
 ## Reporting a security issue
 
-Please do not publish a working sandbox escape or other exploit details in a
-normal issue.
+Please do not put a working sandbox escape or secret-bearing proof of concept
+in a normal public issue.
 
-Use GitHub's private vulnerability reporting flow when it is available for the
-repository. Otherwise, send the report to
-[security@nicdevtv.de](mailto:security@nicdevtv.de).
+Use GitHub's private vulnerability reporting flow when it is enabled for the
+repository. Otherwise, email [security@nicdevtv.de](mailto:security@nicdevtv.de).
 
-Please do not open a public issue with working escape details before there has
-been time to investigate and address the report.
-
-Useful reports include the distribution, kernel version, architecture,
+A useful report includes the Linux distribution, kernel and architecture,
 Bubblewrap version, cargo-cage version, a minimal reproduction, and whether
-the problem comes from a `build.rs`, procedural macro, or child process.
+the problem involves `build.rs`, a procedural macro, a compiler helper, or a
+child process. Please give us a reasonable chance to investigate before
+publishing details.
+
+## Known limits
+
+This release deliberately has no Seccomp, Landlock, resource limits, or
+syscall audit log. It does not defend against kernel, Bubblewrap, Cargo, Rustc,
+toolchain, or host-policy vulnerabilities. It does not prevent resource DoS,
+fork bombs, side channels, every possible secret exposure, or races caused by
+another local process changing paths while setup is in progress.
+
+The workspace and selected runtime/toolchain files are readable by design.
+Data written to `target` is untrusted, and generated artifacts are not made
+safe to execute automatically.

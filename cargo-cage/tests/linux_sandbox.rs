@@ -2,7 +2,6 @@
 
 use cage_testkit::{Fixture, materialize};
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
@@ -23,18 +22,24 @@ fn linux_sandbox_acceptance_matrix() {
     sensitive_environment_is_removed();
     cargo_config_is_hidden();
     runtime_paths_are_hidden();
+    project_toolchain_path_is_rejected_before_compiler_execution();
     inherited_file_descriptors_are_closed();
     parent_death_kills_nested_builds();
     workspace_write_is_denied();
     nested_child_inherits_policy();
     network_is_denied();
+    workspace_special_file_is_rejected();
+    workspace_external_symlink_is_rejected();
+    workspace_external_hardlink_is_rejected();
+    target_external_hardlink_is_rejected();
+    incremental_build_hardlinks_are_allowed();
     symlink_escape_is_denied();
     symlink_target_is_rejected();
     cargo_cache_symlink_is_rejected();
     cargo_git_cache_symlink_is_rejected();
     cargo_cache_nested_symlink_is_rejected();
     cargo_cache_special_file_is_rejected();
-    external_cargo_subcommand_works();
+    cargo_cache_external_hardlink_is_rejected();
     missing_backend_fails_closed();
     old_backend_fails_closed();
     defective_backend_fails_closed();
@@ -159,6 +164,54 @@ fn runtime_paths_are_hidden() {
     assert_policy_failure(&output);
 }
 
+fn project_toolchain_path_is_rejected_before_compiler_execution() {
+    let rustup_available = Command::new("rustup")
+        .args(["which", "rustc"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !rustup_available {
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let toolchain = fixture
+        .temporary_dir("project-toolchain")
+        .expect("project toolchain directory");
+    let bin = toolchain.join("bin");
+    fs::create_dir(&bin).expect("fake toolchain bin directory");
+    let marker = toolchain.join("compiler-ran");
+    let compiler = bin.join("rustc");
+    fs::write(
+        &compiler,
+        format!(
+            "#!/bin/sh\nprintf ran > \"{}\"\nprintf '%s\\n' /usr\n",
+            marker.display()
+        ),
+    )
+    .expect("fake project compiler");
+    let mut permissions = fs::metadata(&compiler)
+        .expect("fake compiler metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&compiler, permissions).expect("make fake compiler executable");
+    fs::write(
+        fixture.file("rust-toolchain.toml"),
+        format!("[toolchain]\npath = \"{}\"\n", toolchain.display()),
+    )
+    .expect("project toolchain override");
+
+    let output = run_cage(&fixture, &[]);
+    assert!(!output.status.success(), "unexpected toolchain success");
+    let text = output_text(&output);
+    assert!(
+        text.contains("Rustup-selected rustc") || text.contains("trusted Rustup toolchains"),
+        "{text}"
+    );
+    assert!(!marker.exists(), "project compiler ran before sandbox");
+}
+
 fn inherited_file_descriptors_are_closed() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let secret = fixture.file("inherited-fd-secret");
@@ -187,7 +240,7 @@ fn inherited_file_descriptors_are_closed() {
     apply_rustup_home(&mut command);
 
     let output = command.output().expect("run cargo-cage with inherited fd");
-    assert_policy_failure(&output);
+    assert_setup_policy_failure(&output, "file descriptor");
     assert_eq!(
         fs::read(&secret).expect("read inherited fd fixture"),
         secret_before
@@ -242,6 +295,78 @@ fn network_is_denied() {
     fs::write(fixture.file("network-endpoint.txt"), endpoint).expect("write network endpoint");
     let output = run_cage_feature(&fixture, "network", &[]);
     assert_policy_failure(&output);
+}
+
+fn workspace_special_file_is_rejected() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let socket_path = fixture.file("workspace.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("workspace socket");
+
+    let output = run_cage(&fixture, &[]);
+    assert_setup_policy_failure(&output, "regular files");
+    assert!(socket_path.exists());
+}
+
+fn workspace_external_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let external = fixture
+        .temporary_dir("workspace-symlink-target")
+        .expect("external workspace target")
+        .join("secret");
+    fs::write(&external, b"must stay outside").expect("write external workspace target");
+    let link = fixture.file("workspace-escape");
+    symlink(&external, &link).expect("workspace symlink");
+
+    let output = run_cage(&fixture, &[]);
+    assert_setup_policy_failure(&output, "symlink");
+    assert!(external.is_file());
+}
+
+fn workspace_external_hardlink_is_rejected() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let external = fixture
+        .temporary_dir("workspace-hardlink-target")
+        .expect("external workspace target")
+        .join("secret");
+    fs::write(&external, b"must stay outside").expect("write external workspace target");
+    let hardlink = fixture.file("workspace-hardlink");
+    fs::hard_link(&external, &hardlink).expect("workspace hardlink");
+
+    let output = run_cage(&fixture, &[]);
+    assert_setup_policy_failure(&output, "hardlink");
+    assert_eq!(
+        fs::read(&external).expect("read external workspace target"),
+        b"must stay outside"
+    );
+}
+
+fn target_external_hardlink_is_rejected() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let target = fixture.file("target");
+    fs::create_dir(&target).expect("target directory");
+    let external = fixture
+        .temporary_dir("target-hardlink-target")
+        .expect("external target")
+        .join("secret");
+    fs::write(&external, b"must stay outside").expect("write external target");
+    fs::hard_link(&external, target.join("hardlink")).expect("target hardlink");
+
+    let output = run_cage(&fixture, &[]);
+    assert_setup_policy_failure(&output, "hardlink");
+    assert_eq!(
+        fs::read(&external).expect("read external target"),
+        b"must stay outside"
+    );
+}
+
+fn incremental_build_hardlinks_are_allowed() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let first = run_cage(&fixture, &[]);
+    assert_success(&first);
+    let second = run_cage(&fixture, &[]);
+    assert_success(&second);
 }
 
 fn symlink_escape_is_denied() {
@@ -339,31 +464,25 @@ fn cargo_cache_special_file_is_rejected() {
     assert!(!fixture.file("target").exists());
 }
 
-fn external_cargo_subcommand_works() {
+fn cargo_cache_external_hardlink_is_rejected() {
     let fixture = materialize("simple-build").expect("simple fixture");
-    let cargo = cargo_program();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_cargo-cage"));
-    let binary_directory = binary.parent().expect("cargo-cage binary directory");
-    let mut command = Command::new(cargo);
-    command
-        .current_dir(fixture.path())
-        .args([
-            "cage",
-            "build",
-            "--manifest-path",
-            fixture
-                .file("Cargo.toml")
-                .to_str()
-                .expect("UTF-8 manifest path"),
-        ])
-        .env("PATH", prepend_path(binary_directory))
-        .env("CARGO_HOME", test_cargo_home(&fixture))
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET_DIR");
-    apply_rustup_home(&mut command);
-    let output = command.output().expect("run cargo cage");
-    assert_success(&output);
-    assert!(fixture.file("target/debug/cage-simple-build").is_file());
+    let cargo_home = test_cargo_home(&fixture);
+    let registry = cargo_home.join("registry");
+    fs::create_dir(&registry).expect("create registry cache");
+    let external = fixture
+        .temporary_dir("cache-hardlink-target")
+        .expect("external cache target")
+        .join("secret");
+    fs::write(&external, b"must stay outside").expect("write external cache target");
+    fs::hard_link(&external, registry.join("hardlink")).expect("cache hardlink");
+
+    let output = run_cage_with_cargo_home(&fixture, &cargo_home, &[]);
+    assert_cache_setup_failure(&output);
+    assert_eq!(
+        fs::read(&external).expect("read external cache target"),
+        b"must stay outside"
+    );
+    assert!(!fixture.file("target").exists());
 }
 
 fn missing_backend_fails_closed() {
@@ -518,10 +637,6 @@ fn base_command(fixture: &Fixture) -> Command {
     base_command_for(fixture, "build")
 }
 
-fn cargo_program() -> OsString {
-    env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
-}
-
 fn test_cargo_home(fixture: &Fixture) -> PathBuf {
     fixture
         .temporary_dir("cargo-home")
@@ -538,14 +653,6 @@ fn apply_rustup_home(command: &mut Command) {
     if let Some(rustup_home) = env::var_os("RUSTUP_HOME") {
         command.env("RUSTUP_HOME", rustup_home);
     }
-}
-
-fn prepend_path(directory: &Path) -> OsString {
-    let mut entries = vec![directory.to_path_buf()];
-    if let Some(path) = env::var_os("PATH") {
-        entries.extend(env::split_paths(&path));
-    }
-    env::join_paths(entries).expect("valid PATH")
 }
 
 fn apply_extra_environment(command: &mut Command, extra: &[(&str, &str)]) {
@@ -593,7 +700,7 @@ fn assert_cache_setup_failure(output: &Output) {
     let text = output_text(output);
     assert!(text.contains("Cargo cache"), "{text}");
     assert!(
-        text.contains("symlink") || text.contains("regular files"),
+        text.contains("symlink") || text.contains("regular files") || text.contains("hardlink"),
         "{text}"
     );
     assert!(text.contains("remedy:"), "{text}");

@@ -36,14 +36,17 @@ pub fn parse_invocation<I>(args: I) -> CageResult<CargoInvocation>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args = args.into_iter().collect::<Vec<_>>();
+    let args = args.into_iter().collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == OsStr::new("cage")) {
-        args.remove(0);
+        return Err(CageError::InvalidInvocation(
+            "the `cargo cage` dispatcher form is not supported because Cargo aliases can bypass this sandbox; invoke `cargo-cage` directly"
+                .to_owned(),
+        ));
     }
 
     let Some(command) = args.first() else {
         return Err(CageError::InvalidInvocation(
-            "expected `cargo cage <build|check|test|doc|doctor> [OPTIONS]`".to_owned(),
+            "expected `cargo-cage <build|check|test|doc|doctor> [OPTIONS]`".to_owned(),
         ));
     };
     if command == OsStr::new("--help") || command == OsStr::new("-h") {
@@ -93,7 +96,7 @@ pub fn is_help_request(args: &[OsString]) -> bool {
 }
 
 pub fn help_text() -> &'static str {
-    "cargo-cage v0.3.0\n\nUSAGE:\n    cargo cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo cage doctor [--verbose]\n    cargo-cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo-cage doctor [--verbose]\n\nCargo runs in an experimental Linux sandbox. Network access is denied,\nHOME is private, the child environment uses a fixed allowlist, and persistent\nwrites are limited to target and Cargo.lock. Dependencies must be available\nlocally; use `cargo fetch` separately before running an offline command.\n\n`doctor` checks Bubblewrap, namespaces, workspace paths, toolchain paths, and\nCargo caches without modifying the project.\n"
+    "cargo-cage v0.3.0\n\nUSAGE:\n    cargo-cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo-cage doctor [--verbose]\n\nCargo runs in an experimental Linux sandbox. Network access is denied,\nHOME is private, the child environment uses a fixed allowlist, and persistent\nwrites are limited to target and Cargo.lock. Dependencies must be available\nlocally; use `cargo fetch` separately before running an offline command.\n\nThe direct `cargo-cage` executable is required for the security boundary.\nThe `cargo cage` dispatcher form is intentionally unsupported because Cargo\nconfiguration aliases can bypass external subcommands.\n\n`doctor` checks Bubblewrap, namespaces, workspace paths, toolchain paths, and\nCargo caches without modifying the project.\n"
 }
 
 #[cfg(test)]
@@ -101,20 +104,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_external_cargo_invocation() {
-        let invocation = parse_invocation([
+    fn rejects_cargo_dispatcher_invocation() {
+        let error = parse_invocation([
             OsString::from("cage"),
             OsString::from("build"),
             OsString::from("--release"),
         ])
-        .expect("valid invocation");
-        assert_eq!(
-            invocation,
-            CargoInvocation::Cargo {
-                command: CargoCommand::Build,
-                args: vec![OsString::from("--release")]
-            }
-        );
+        .expect_err("Cargo dispatcher form must be rejected");
+        assert!(error.to_string().contains("dispatcher form"));
+        assert!(error.to_string().contains("cargo-cage"));
     }
 
     #[test]
@@ -179,13 +177,13 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_help_in_both_forms() {
+    fn recognizes_direct_help_only() {
         assert!(is_help_request(&[OsString::from("--help")]));
-        assert!(is_help_request(&[
+        assert!(!is_help_request(&[
             OsString::from("cage"),
             OsString::from("--help")
         ]));
-        assert!(is_help_request(&[
+        assert!(!is_help_request(&[
             OsString::from("cage"),
             OsString::from("doctor"),
             OsString::from("--help")
