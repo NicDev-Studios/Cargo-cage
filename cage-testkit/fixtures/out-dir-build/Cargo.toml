@@ -1,0 +1,12 @@
+[package]
+name = "cage-out-dir-build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+build = "build.rs"
+
+[[bin]]
+name = "cage-out-dir-build"
+path = "src/main.rs"
+
+[workspace]

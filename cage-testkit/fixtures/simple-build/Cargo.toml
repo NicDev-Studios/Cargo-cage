@@ -1,0 +1,11 @@
+[package]
+name = "cage-simple-build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[[bin]]
+name = "cage-simple-build"
+path = "src/main.rs"
+
+[workspace]

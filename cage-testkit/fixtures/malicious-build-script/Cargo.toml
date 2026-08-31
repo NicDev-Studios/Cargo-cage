@@ -1,0 +1,12 @@
+[package]
+name = "cage-malicious-build-script"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+build = "build.rs"
+
+[[bin]]
+name = "cage-malicious-build-script"
+path = "src/main.rs"
+
+[workspace]
