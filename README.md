@@ -27,6 +27,8 @@ dedicated build service, or a careful review of the code you build.
 - Starts Cargo with an empty environment and a reviewed Cargo/Rust/locale
   allowlist. Host secrets, credentials, agent sockets, `HOME`, and arbitrary
   project variables are not inherited.
+- Keeps normal stdin/stdout/stderr, but scrubs extra inherited file
+  descriptors before Cargo starts.
 - Uses a private `CARGO_HOME`. Only checked `registry` and `git` caches are
   mounted read-only. Cargo user configuration and credentials are deliberately
   left outside the cage.

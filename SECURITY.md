@@ -33,7 +33,8 @@ The child starts with an empty environment. A fixed allowlist supplies the
 Cargo/Rust, compiler, locale, and terminal values needed for normal builds.
 Credentials, agent variables, `CARGO_HOME`, `RUSTUP_HOME`, and arbitrary host
 variables do not cross the boundary. Policy removals win over later
-environment values.
+environment values. Standard stdio is kept for normal Cargo behaviour; extra
+inherited file descriptors are closed before the build process starts.
 
 Cargo gets a private `CARGO_HOME`. Only existing `registry` and `git` caches
 are considered, and only after their roots and contents pass validation.
@@ -70,8 +71,7 @@ Cargo is tracking the upstream fix in
 Please do not put a working sandbox escape or secret-bearing proof of concept
 in a normal public issue.
 
-Use GitHub's private vulnerability reporting flow when it is enabled for the
-repository. Otherwise, email [security@nicdevtv.de](mailto:security@nicdevtv.de).
+Use GitHub's private vulnerability reporting flow. Otherwise, email [security@nicdevtv.de](mailto:security@nicdevtv.de).
 
 A useful report includes the Linux distribution, kernel and architecture,
 Bubblewrap version, cargo-cage version, a minimal reproduction, and whether

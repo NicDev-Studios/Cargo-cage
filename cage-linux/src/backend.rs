@@ -73,6 +73,23 @@ session_leader=$(/usr/bin/ps -o sid= -p 1 | /usr/bin/tr -d '[:space:]') \
   || fail "sandbox command is not in Bubblewrap's new session"
 printf '%s\n' cargo-cage-namespace-preflight-ok
 "#;
+#[cfg(target_os = "linux")]
+const FD_SCRUBBER: &str = r#"set -eu
+[ -d /proc/self/fd ] || {
+  printf 'cargo-cage file-descriptor scrubber failed: /proc/self/fd is unavailable\n' >&2
+  exit 125
+}
+for fd_path in /proc/self/fd/*; do
+  fd=${fd_path##*/}
+  case "$fd" in
+    ''|*[!0-9]*) continue ;;
+  esac
+  if [ "$fd" -ge 3 ]; then
+    eval "exec ${fd}>&-"
+  fi
+done
+exec "$@"
+"#;
 
 #[derive(Clone, Debug)]
 pub struct LinuxSandbox {
@@ -112,7 +129,6 @@ impl LinuxSandbox {
         args: &[OsString],
         output_mode: OutputMode,
     ) -> CageResult<SandboxOutcome> {
-        reject_inherited_file_descriptors()?;
         let mut command = Command::new(&self.bwrap);
         command.args(build_bwrap_args(plan, program, args));
         command.current_dir(&plan.current_dir);
@@ -656,6 +672,10 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
     }
 
     command.push(OsString::from("--"));
+    command.push(PathBuf::from("/bin/sh").into_os_string());
+    command.push(OsString::from("-c"));
+    command.push(OsString::from(FD_SCRUBBER));
+    command.push(OsString::from("cargo-cage-fd-scrubber"));
     command.push(program.to_path_buf().into_os_string());
     command.extend(args.iter().cloned());
     command
@@ -668,36 +688,6 @@ where
     T: Into<OsString>,
 {
     destination.extend(values.into_iter().map(Into::into));
-}
-
-#[cfg(target_os = "linux")]
-fn reject_inherited_file_descriptors() -> CageResult<()> {
-    let entries = fs::read_dir("/proc/self/fd").map_err(|error| {
-        CageError::io(
-            "could not inspect inherited file descriptors; close non-stdio descriptors before retrying",
-            error,
-        )
-    })?;
-    let descriptors = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter_map(|name| name.parse::<u32>().ok())
-        .filter(|descriptor| *descriptor >= 3)
-        .collect::<Vec<_>>();
-
-    // The directory iterator itself briefly owns a descriptor. Inspect the
-    // candidates after dropping the iterator so that temporary scan state is
-    // not mistaken for a caller-owned descriptor.
-    for descriptor in descriptors {
-        if fs::read_link(format!("/proc/self/fd/{descriptor}")).is_ok() {
-            return Err(CageError::policy(
-                format!("file descriptor {descriptor}"),
-                "inherited file descriptors >= 3 are not passed into the sandbox",
-                "close the descriptor or start cargo-cage with only standard stdio open",
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1714,6 +1704,13 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--new-session"));
         assert!(args.iter().any(|arg| arg == "--die-with-parent"));
         assert!(args.iter().any(|arg| arg == "--"));
+        let command_separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("bubblewrap command separator");
+        assert_eq!(args[command_separator + 1], "/bin/sh");
+        assert_eq!(args[command_separator + 2], "-c");
+        assert_eq!(args[command_separator + 3], FD_SCRUBBER);
         assert!(!args.iter().any(|arg| arg == "--share-net"));
         assert!(!args.iter().any(|arg| arg == "--clearenv"));
         assert!(!args.iter().any(|arg| arg == "--seccomp"));
@@ -1723,6 +1720,8 @@ mod tests {
         assert!(NAMESPACE_PREFLIGHT.contains("CapBnd"));
         assert!(NAMESPACE_PREFLIGHT.contains("parent_session=\"$7\""));
         assert!(NAMESPACE_PREFLIGHT.contains("session_leader="));
+        assert!(FD_SCRUBBER.contains("/proc/self/fd"));
+        assert!(FD_SCRUBBER.contains("eval \"exec ${fd}>&-\""));
 
         let allow_plan = SandboxPlan {
             network: NetworkAccess::Allow,

@@ -23,7 +23,7 @@ fn linux_sandbox_acceptance_matrix() {
     cargo_config_is_hidden();
     runtime_paths_are_hidden();
     project_toolchain_path_is_rejected_before_compiler_execution();
-    inherited_file_descriptors_are_closed();
+    inherited_file_descriptors_do_not_reach_the_build();
     parent_death_kills_nested_builds();
     workspace_write_is_denied();
     nested_child_inherits_policy();
@@ -212,7 +212,7 @@ fn project_toolchain_path_is_rejected_before_compiler_execution() {
     assert!(!marker.exists(), "project compiler ran before sandbox");
 }
 
-fn inherited_file_descriptors_are_closed() {
+fn inherited_file_descriptors_do_not_reach_the_build() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let secret = fixture.file("inherited-fd-secret");
     let secret_before = b"must not be readable through fd 3";
@@ -240,7 +240,7 @@ fn inherited_file_descriptors_are_closed() {
     apply_rustup_home(&mut command);
 
     let output = command.output().expect("run cargo-cage with inherited fd");
-    assert_setup_policy_failure(&output, "file descriptor");
+    assert_policy_failure(&output);
     assert_eq!(
         fs::read(&secret).expect("read inherited fd fixture"),
         secret_before

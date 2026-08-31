@@ -62,6 +62,8 @@ environment populated from a fixed allowlist. Existing `registry` and `git`
 caches are mounted read-only only after checking their roots and contents.
 Cargo user config and credential files stay out of the sandbox. A project-local
 Cargo config remains visible because it is project input, not host trust.
+Standard stdio remains connected; extra inherited file descriptors are scrubbed
+before the build process is exec'd.
 
 Workspace, cache, target, lockfile, hidden, and toolchain paths are checked
 before mounting. Traversal, unsafe symlink resolution, special files, nested
