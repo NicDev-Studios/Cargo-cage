@@ -28,6 +28,12 @@ service.
 The reference environment is Ubuntu 24.04 x86_64 with unprivileged user
 namespaces enabled and Bubblewrap 0.8 or newer.
 
+The host security policy must also allow `/usr/bin/bwrap` to create the
+unprivileged namespace it needs. On Ubuntu 24.04, AppArmor can deny this even
+when the kernel setting is enabled. The CI workflow prepares its ephemeral
+runner explicitly; production hosts should use a narrow AppArmor rule rather
+than weakening the policy globally.
+
 ```sh
 sudo apt-get install bubblewrap
 cargo install --path cargo-cage

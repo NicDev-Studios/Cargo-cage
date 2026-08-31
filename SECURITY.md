@@ -10,7 +10,8 @@ The intended security boundary and its assumptions are documented in
 ## Supported platform
 
 The supported reference platform is Ubuntu 24.04 x86_64 with Bubblewrap 0.8 or
-newer and unprivileged user namespaces enabled. Other Linux distributions may
+newer, unprivileged user namespaces enabled, and a host AppArmor policy that
+allows `/usr/bin/bwrap` to perform its setup. Other Linux distributions may
 work, but are not the reference environment. macOS and Windows are not
 supported in v0.1.
 

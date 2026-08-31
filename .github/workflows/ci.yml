@@ -16,6 +16,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Prepare Ubuntu for Bubblewrap namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            test "$(< /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 0
+          fi
       - name: Install sandbox runtime
         run: sudo apt-get update && sudo apt-get install --yes bubblewrap
       - name: Check sandbox runtime
@@ -26,4 +32,3 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace
-

@@ -18,8 +18,9 @@ The main assets are:
 - files outside the allowed build outputs;
 - host processes and host IPC, to the extent covered by the namespaces.
 
-The Linux kernel, Bubblewrap, Cargo, Rustc, and the user's selected toolchain
-are trusted components for this MVP.
+The Linux kernel, host security policy, Bubblewrap, Cargo, Rustc, and the
+user's selected toolchain are trusted components for this MVP. The host policy
+must permit Bubblewrap to create the namespaces required by the sandbox.
 
 ## Enforced policy
 

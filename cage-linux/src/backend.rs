@@ -163,7 +163,7 @@ impl SandboxBackend for LinuxSandbox {
             if !preflight.status.successfully_exited()
                 || preflight.stdout != NAMESPACE_PREFLIGHT_OUTPUT
             {
-                let detail = format_output(&preflight.stderr);
+                let detail = sandbox_setup_detail(&preflight.stderr);
                 return Err(CageError::SandboxSetup(format!(
                     "Bubblewrap could not activate the requested policy or complete its namespace preflight{}",
                     detail
@@ -722,14 +722,20 @@ fn version_at_least(actual: (u32, u32, u32), required: (u32, u32, u32)) -> bool 
 }
 
 #[cfg(target_os = "linux")]
-fn format_output(output: &[u8]) -> String {
+fn sandbox_setup_detail(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);
     let text = text.trim();
     if text.is_empty() {
-        String::new()
-    } else {
-        format!(": {text}")
+        return String::new();
     }
+
+    let apparmor_hint = if text.contains("RTM_NEWADDR") && text.contains("Operation not permitted")
+    {
+        " Ubuntu 24.04 AppArmor may be blocking the unprivileged user namespace; allow Bubblewrap in the host policy before retrying."
+    } else {
+        ""
+    };
+    format!(": {text}.{apparmor_hint}")
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -805,6 +811,14 @@ mod tests {
         )
         .expect_err("writable parent would reveal hidden path");
         assert!(error.to_string().contains("re-expose"));
+    }
+
+    #[test]
+    fn explains_ubuntu_namespace_permission_failure() {
+        let detail =
+            sandbox_setup_detail(b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n");
+        assert!(detail.contains("AppArmor"));
+        assert!(detail.contains("allow Bubblewrap"));
     }
 
     fn contains_pair(args: &[OsString], option: &str, first: &str, second: &str) -> bool {
