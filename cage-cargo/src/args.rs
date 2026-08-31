@@ -26,7 +26,7 @@ where
     }
     if command != OsStr::new("build") {
         return Err(CageError::InvalidInvocation(format!(
-            "unsupported command `{}`; v0.1 supports only `build`",
+            "unsupported command `{}`; v0.2 supports only `build`",
             command.to_string_lossy()
         )));
     }
@@ -49,7 +49,7 @@ pub fn is_help_request(args: &[OsString]) -> bool {
 }
 
 pub fn help_text() -> &'static str {
-    "cargo-cage v0.1.0\n\nUSAGE:\n    cargo cage build [CARGO_OPTIONS...]\n    cargo-cage build [CARGO_OPTIONS...]\n\nThe build runs in an experimental Linux sandbox. Network access is denied,\nsensitive home paths are hidden, and persistent writes are limited to target\nand Cargo.lock. Dependencies must be available locally; use `cargo fetch`\nseparately before running an offline build.\n"
+    "cargo-cage v0.2.0\n\nUSAGE:\n    cargo cage build [CARGO_OPTIONS...]\n    cargo-cage build [CARGO_OPTIONS...]\n\nThe build runs in an experimental Linux sandbox. Network access is denied,\nsensitive home paths are hidden, and persistent writes are limited to target\nand Cargo.lock. Dependencies must be available locally; use `cargo fetch`\nseparately before running an offline build.\n"
 }
 
 #[cfg(test)]

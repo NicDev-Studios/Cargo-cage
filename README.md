@@ -1,25 +1,29 @@
 # cargo-cage
 
-`cargo-cage` is an experimental Linux tool that runs Cargo builds inside a
-Bubblewrap sandbox. That includes `build.rs`, procedural macros, compiler
-helpers, and child processes started by them.
+`cargo-cage` is an experimental Linux wrapper for Cargo builds. It runs
+Cargo, `build.rs`, procedural macros, compiler helpers, and their child
+processes inside a Bubblewrap sandbox.
 
-This is a small extra boundary around a build. It is not a complete security
-guarantee, and it is not a replacement for a container or a hardened build
-service.
+This is a practical extra boundary around a local build. It is not a complete
+security guarantee and it is not a replacement for a hardened build service.
 
-## What v0.1 does
+## What v0.2 does
 
-- Blocks network access by default. There is no network opt-in in the CLI.
+- Denies network access by default and forces Cargo offline mode.
 - Mounts the host filesystem read-only.
-- Allows persistent writes only to the workspace `target` directory and the
-  workspace `Cargo.lock`.
-- Keeps `OUT_DIR` and normal Cargo build output working under `target`.
-- Provides private, throwaway `/tmp` and `/run` filesystems. `TMPDIR` is set
-  to `/tmp` inside the sandbox.
+- Allows persistent writes only to the canonical workspace `target` directory
+  and the workspace `Cargo.lock`.
+- Keeps normal Cargo output and `OUT_DIR` working under `target`.
+- Provides private, throwaway `/tmp` and `/run` filesystems.
 - Hides common sensitive paths such as `~/.ssh`, `~/.aws`, `~/.config`, and
   Cargo credentials.
-- Removes common credential and agent environment variables.
+- Removes common credential and agent environment variables. A policy removal
+  always wins over an environment value supplied to the child.
+- Uses a private `CARGO_HOME`. Only validated `registry` and `git` caches are
+  mounted read-only. Cargo `config` and `config.toml` are intentionally not
+  mounted because they may contain credentials or credential providers.
+- Rejects symlinked or special-file Cargo cache entries, and cache sources that
+  overlap writable, hidden, or private paths, before starting Cargo.
 - Refuses to run if Bubblewrap is missing, too old, or cannot activate the
   requested namespaces. There is no unsandboxed fallback.
 
@@ -28,11 +32,11 @@ service.
 The reference environment is Ubuntu 24.04 x86_64 with unprivileged user
 namespaces enabled and Bubblewrap 0.8 or newer.
 
-The host security policy must also allow `/usr/bin/bwrap` to create the
-unprivileged namespace it needs. On Ubuntu 24.04, AppArmor can deny this even
-when the kernel setting is enabled. The CI workflow prepares its ephemeral
-runner explicitly; production hosts should use a narrow AppArmor rule rather
-than weakening the policy globally.
+The host security policy must also allow Bubblewrap to create the namespaces
+it needs. On Ubuntu 24.04, AppArmor can deny this even when the kernel setting
+is enabled. The CI workflow prepares its ephemeral runner explicitly;
+production hosts should use a narrow host-policy rule rather than weakening
+the policy globally.
 
 ```sh
 sudo apt-get install bubblewrap
@@ -47,8 +51,9 @@ cargo fetch
 cargo cage build
 ```
 
-Missing registry or Git data is reported by Cargo. `cargo-cage` never fetches
-it automatically and never opens the sandbox network for that purpose.
+`cargo-cage` never fetches automatically and never opens the sandbox network
+for that purpose. If a cache is missing, Cargo keeps its native offline error
+and `cargo-cage` explains that `cargo fetch` must be run separately.
 
 ## Usage
 
@@ -86,6 +91,16 @@ cargo cage build
 test ! -e build-script-write.txt
 ```
 
+## Failure behavior
+
+Policy and setup failures stop the build before an unsafe Cargo process is
+started. The error names the affected path or variable, the rule that was
+violated, and a concrete remedy.
+
+When Cargo itself fails, its normal output is preserved. The additional
+`cargo-cage` message describes the active boundaries, but it does not claim to
+audit every denied syscall.
+
 ## Limits
 
 The threat model is deliberately narrow. The tool does not protect against
@@ -94,9 +109,14 @@ solve resource exhaustion, fork bombs, side channels, or every possible secret
 in the environment and filesystem. Most of the host filesystem remains
 readable.
 
+The path checks are `std`-only and are not race-free against another local
+process changing the filesystem at the same time. Hard-link aliases and
+future filesystem or kernel bugs are outside this MVP's guarantee.
+
 Artifacts written to `target` are not trusted automatically, and the tool does
-not make their later execution safe. There is no GUI, dependency reputation
-system, AI detection, automatic fetch, or macOS/Windows backend in v0.1.
+not make their later execution safe. There is no seccomp profile, GUI,
+dependency reputation system, AI detection, automatic fetch, or macOS/Windows
+backend in this release.
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) and [SECURITY.md](SECURITY.md) before
 relying on this for real build isolation.

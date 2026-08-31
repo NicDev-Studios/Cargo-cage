@@ -61,7 +61,7 @@ impl LinuxSandbox {
             let version = bwrap_version(&bwrap)?;
             if !version_at_least(version, (MIN_BWRAP_MAJOR, MIN_BWRAP_MINOR, 0)) {
                 return Err(CageError::BackendUnavailable(format!(
-                    "{} is too old; Bubblewrap >= {}.{} is required",
+                    "{} is too old; Bubblewrap >= {}.{} is required; install a newer Bubblewrap or set CARGO_CAGE_BWRAP to a trusted absolute executable",
                     bwrap.display(),
                     MIN_BWRAP_MAJOR,
                     MIN_BWRAP_MINOR
@@ -74,7 +74,6 @@ impl LinuxSandbox {
     #[cfg(target_os = "linux")]
     fn run_inner(
         &self,
-        request: &SandboxRequest,
         plan: &SandboxPlan,
         program: &Path,
         args: &[OsString],
@@ -83,19 +82,8 @@ impl LinuxSandbox {
         let mut command = Command::new(&self.bwrap);
         command.args(build_bwrap_args(plan, program, args));
         command.current_dir(&plan.current_dir);
-        command.envs(
-            request
-                .environment
-                .set
-                .iter()
-                .map(|(key, value)| (key, value)),
-        );
-        for key in request
-            .environment
-            .remove
-            .iter()
-            .chain(request.policy.remove_environment.iter())
-        {
+        command.envs(plan.environment.set.iter().map(|(key, value)| (key, value)));
+        for key in &plan.environment.remove {
             command.env_remove(key);
         }
 
@@ -154,7 +142,6 @@ impl SandboxBackend for LinuxSandbox {
             ];
             preflight_args.extend(namespace_markers);
             let preflight = self.run_inner(
-                request,
                 &plan,
                 Path::new("/bin/sh"),
                 &preflight_args,
@@ -165,17 +152,11 @@ impl SandboxBackend for LinuxSandbox {
             {
                 let detail = sandbox_setup_detail(&preflight.stderr);
                 return Err(CageError::SandboxSetup(format!(
-                    "Bubblewrap could not activate the requested policy or complete its namespace preflight{}",
-                    detail
+                    "Bubblewrap could not activate the requested policy or complete its namespace preflight{}. Check unprivileged user namespaces and the host AppArmor policy before retrying",
+                    detail,
                 )));
             }
-            self.run_inner(
-                request,
-                &plan,
-                &request.program,
-                &request.args,
-                request.output,
-            )
+            self.run_inner(&plan, &request.program, &request.args, request.output)
         }
     }
 }
@@ -187,7 +168,7 @@ struct SandboxPlan {
     hidden_paths: Vec<MaskPath>,
     private_paths: Vec<PathBuf>,
     read_only_paths: Vec<PathBuf>,
-    cargo_home: Option<PathBuf>,
+    cargo_cache_paths: Vec<PathBuf>,
     environment: Environment,
     network: NetworkAccess,
 }
@@ -247,8 +228,26 @@ impl SandboxPlan {
             .collect::<Vec<_>>();
 
         validate_read_only_paths(&read_only_paths, &private_paths)?;
-        validate_writable_paths(&writable_paths, &hidden_paths)?;
+        validate_writable_paths(
+            &writable_paths,
+            &hidden_paths,
+            &private_paths,
+            &read_only_paths,
+        )?;
         let cargo_home = host_cargo_home()?;
+        let cargo_cache_paths = cargo_home
+            .as_deref()
+            .map(|cargo_home| {
+                validate_cargo_cache_paths(
+                    cargo_home,
+                    &writable_paths,
+                    &hidden_paths,
+                    &private_paths,
+                    &read_only_paths,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let environment = merged_environment(request);
 
         Ok(Self {
@@ -257,7 +256,7 @@ impl SandboxPlan {
             hidden_paths,
             private_paths,
             read_only_paths,
-            cargo_home,
+            cargo_cache_paths,
             environment,
             network: request.policy.network,
         })
@@ -285,36 +284,6 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
             OsString::from(CARGO_HOME_IN_SANDBOX),
         ],
     );
-    if let Some(cargo_home) = &plan.cargo_home {
-        for name in ["registry", "git"] {
-            let source = cargo_home.join(name);
-            let destination = Path::new(CARGO_HOME_IN_SANDBOX).join(name);
-            push_args(
-                &mut command,
-                [
-                    OsString::from("--ro-bind-try"),
-                    source.into_os_string(),
-                    destination.into_os_string(),
-                ],
-            );
-        }
-        for name in ["config.toml", "config"] {
-            let source = cargo_home.join(name);
-            // A symlink could make a config mount expose a credentials file.
-            if is_real_regular_file(&source) {
-                let destination = Path::new(CARGO_HOME_IN_SANDBOX).join(name);
-                push_args(
-                    &mut command,
-                    [
-                        OsString::from("--ro-bind"),
-                        source.into_os_string(),
-                        destination.into_os_string(),
-                    ],
-                );
-            }
-        }
-    }
-
     for path in &plan.read_only_paths {
         push_args(
             &mut command,
@@ -322,6 +291,22 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
                 OsString::from("--ro-bind"),
                 path.clone().into_os_string(),
                 path.clone().into_os_string(),
+            ],
+        );
+    }
+
+    for source in &plan.cargo_cache_paths {
+        let destination = Path::new(CARGO_HOME_IN_SANDBOX).join(
+            source
+                .file_name()
+                .expect("cache path has a final component"),
+        );
+        push_args(
+            &mut command,
+            [
+                OsString::from("--ro-bind"),
+                source.clone().into_os_string(),
+                destination.into_os_string(),
             ],
         );
     }
@@ -386,26 +371,25 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
             [OsString::from("--setenv"), key.clone(), value.clone()],
         );
     }
-    push_args(
-        &mut command,
-        [
-            OsString::from("--setenv"),
-            OsString::from("CARGO_HOME"),
-            OsString::from(CARGO_HOME_IN_SANDBOX),
-        ],
-    );
+    if !plan
+        .environment
+        .remove
+        .contains(&OsString::from("CARGO_HOME"))
+    {
+        push_args(
+            &mut command,
+            [
+                OsString::from("--setenv"),
+                OsString::from("CARGO_HOME"),
+                OsString::from(CARGO_HOME_IN_SANDBOX),
+            ],
+        );
+    }
 
     command.push(OsString::from("--"));
     command.push(program.to_path_buf().into_os_string());
     command.extend(args.iter().cloned());
     command
-}
-
-#[cfg(target_os = "linux")]
-fn is_real_regular_file(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -425,10 +409,14 @@ fn merged_environment(request: &SandboxRequest) -> Environment {
             remove.push(key.clone());
         }
     }
-    Environment {
-        set: request.environment.set.clone(),
-        remove,
-    }
+    let set = request
+        .environment
+        .set
+        .iter()
+        .filter(|(key, _)| !remove.contains(key))
+        .cloned()
+        .collect();
+    Environment { set, remove }
 }
 
 #[cfg(target_os = "linux")]
@@ -457,29 +445,182 @@ fn host_cargo_home() -> CageResult<Option<PathBuf>> {
         return Ok(None);
     };
     if !path.is_absolute() {
-        return Err(CageError::Policy(
-            "CARGO_HOME must be absolute when it is set".to_owned(),
+        return Err(CageError::policy(
+            path.display().to_string(),
+            "CARGO_HOME must be an absolute path",
+            "set CARGO_HOME to the absolute path of a real Cargo home",
         ));
     }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() => {
-            Ok(Some(fs::canonicalize(&path).map_err(|error| {
-                CageError::io(
-                    format!("could not canonicalize CARGO_HOME {}", path.display()),
-                    error,
-                )
-            })?))
+            Ok(Some(canonical_path_without_symlink(&path, "CARGO_HOME")?))
         }
-        Ok(_) => Err(CageError::Policy(format!(
-            "CARGO_HOME {} is not a directory",
-            path.display()
-        ))),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CageError::policy(
+            path.display().to_string(),
+            "CARGO_HOME must not be a symlink",
+            "set CARGO_HOME to an existing real directory or unset it",
+        )),
+        Ok(_) => Err(CageError::policy(
+            path.display().to_string(),
+            "CARGO_HOME must be a directory",
+            "remove the conflicting file and set CARGO_HOME to a real directory",
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(CageError::io(
             format!("could not inspect CARGO_HOME {}", path.display()),
             error,
         )),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cargo_cache_paths(
+    cargo_home: &Path,
+    writable_paths: &[PathBuf],
+    hidden_paths: &[MaskPath],
+    private_paths: &[PathBuf],
+    read_only_paths: &[PathBuf],
+) -> CageResult<Vec<PathBuf>> {
+    let mut caches = Vec::new();
+    for name in ["registry", "git"] {
+        let path = cargo_home.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CageError::io(
+                    format!("could not inspect Cargo cache {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(CageError::policy(
+                path.display().to_string(),
+                "Cargo cache mount sources must not be symlinks",
+                "remove the symlink or point CARGO_HOME at a real Cargo home",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(CageError::policy(
+                path.display().to_string(),
+                "Cargo cache mount sources must be directories",
+                "remove the conflicting file or recreate the cache directory",
+            ));
+        }
+
+        let cache = canonical_path_without_symlink(&path, "Cargo cache")?;
+        validate_cache_source_policy(
+            &cache,
+            writable_paths,
+            hidden_paths,
+            private_paths,
+            read_only_paths,
+        )?;
+        validate_cache_tree(&cache)?;
+        caches.push(cache);
+    }
+    Ok(caches)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cache_source_policy(
+    cache: &Path,
+    writable_paths: &[PathBuf],
+    hidden_paths: &[MaskPath],
+    private_paths: &[PathBuf],
+    read_only_paths: &[PathBuf],
+) -> CageResult<()> {
+    if let Some(writable) = writable_paths
+        .iter()
+        .find(|writable| paths_overlap(cache, writable))
+    {
+        return Err(CageError::policy(
+            cache.display().to_string(),
+            format!(
+                "a read-only Cargo cache must not overlap writable path {}",
+                writable.display()
+            ),
+            "move CARGO_HOME outside the writable build target",
+        ));
+    }
+    if let Some(hidden) = hidden_paths.iter().find(|hidden| {
+        let hidden = match hidden {
+            MaskPath::Directory(path) | MaskPath::File(path) => path,
+        };
+        paths_overlap(cache, hidden)
+    }) {
+        let hidden = match hidden {
+            MaskPath::Directory(path) | MaskPath::File(path) => path,
+        };
+        return Err(CageError::policy(
+            cache.display().to_string(),
+            format!(
+                "a Cargo cache must not overlap hidden path {}",
+                hidden.display()
+            ),
+            "move CARGO_HOME outside protected home paths",
+        ));
+    }
+    if let Some(private_path) = private_paths.iter().find(|private| {
+        paths_overlap(cache, private)
+            && !is_reexposed_below_private(cache, private, read_only_paths)
+    }) {
+        return Err(CageError::policy(
+            cache.display().to_string(),
+            format!(
+                "a Cargo cache must not overlap private filesystem {}",
+                private_path.display()
+            ),
+            "move CARGO_HOME to a persistent host directory outside /tmp and /run",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cache_tree(root: &Path) -> CageResult<()> {
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            CageError::io(
+                format!("could not inspect Cargo cache {}", directory.display()),
+                error,
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CageError::io(
+                    format!("could not inspect Cargo cache {}", directory.display()),
+                    error,
+                )
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                CageError::io(
+                    format!("could not inspect Cargo cache entry {}", path.display()),
+                    error,
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(CageError::policy(
+                    path.display().to_string(),
+                    "mounted Cargo caches must not contain symlinks",
+                    "remove the symlink or run cargo fetch in a clean Cargo home",
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if !metadata.is_file() {
+                return Err(CageError::policy(
+                    path.display().to_string(),
+                    "mounted Cargo caches may contain only regular files and directories",
+                    "remove the special file before running cargo-cage",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -491,17 +632,13 @@ fn canonical_existing_dir(path: &Path, label: &str) -> CageResult<PathBuf> {
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(CageError::Policy(format!(
-            "{label} {} must be a real directory",
-            path.display()
-        )));
+        return Err(CageError::policy(
+            path.display().to_string(),
+            format!("{label} must be a real directory without symlink resolution"),
+            "replace the path with an existing real directory",
+        ));
     }
-    fs::canonicalize(path).map_err(|error| {
-        CageError::io(
-            format!("could not canonicalize {label} {}", path.display()),
-            error,
-        )
-    })
+    canonical_path_without_symlink(path, label)
 }
 
 #[cfg(target_os = "linux")]
@@ -523,16 +660,18 @@ fn canonical_path_without_symlink(path: &Path, label: &str) -> CageResult<PathBu
             )
         })?;
         if metadata.file_type().is_symlink() {
-            return Err(CageError::Policy(format!(
-                "{label} {} must not contain symlink components",
-                path.display()
-            )));
+            return Err(CageError::policy(
+                path.display().to_string(),
+                format!("{label} must not contain symlink components"),
+                "replace the symlink component with a real directory or file",
+            ));
         }
         if components.peek().is_some() && !metadata.is_dir() {
-            return Err(CageError::Policy(format!(
-                "{label} parent {} is not a directory",
-                current.display()
-            )));
+            return Err(CageError::policy(
+                current.display().to_string(),
+                format!("{label} parent components must be directories"),
+                "remove the conflicting file and retry with a directory path",
+            ));
         }
     }
     fs::canonicalize(path).map_err(|error| {
@@ -562,10 +701,11 @@ fn make_mask(path: &Path) -> CageResult<Option<MaskPath>> {
         )
     })?;
     if resolved == Path::new("/") {
-        return Err(CageError::Policy(format!(
-            "hidden path {} resolves to the filesystem root",
-            path.display()
-        )));
+        return Err(CageError::policy(
+            path.display().to_string(),
+            "a hidden path must not resolve to the filesystem root",
+            "remove the invalid hidden-path entry and retry",
+        ));
     }
     let target_metadata = if metadata.file_type().is_symlink() {
         fs::metadata(&resolved).map_err(|error| {
@@ -588,11 +728,18 @@ fn make_mask(path: &Path) -> CageResult<Option<MaskPath>> {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_writable_paths(paths: &[PathBuf], hidden: &[MaskPath]) -> CageResult<()> {
+fn validate_writable_paths(
+    paths: &[PathBuf],
+    hidden: &[MaskPath],
+    private: &[PathBuf],
+    read_only: &[PathBuf],
+) -> CageResult<()> {
     for writable in paths {
         if writable == Path::new("/") {
-            return Err(CageError::Policy(
-                "the filesystem root cannot be writable".to_owned(),
+            return Err(CageError::policy(
+                writable.display().to_string(),
+                "the filesystem root cannot be writable",
+                "limit writable_paths to the intended build output directory or lockfile",
             ));
         }
         for mask in hidden {
@@ -600,17 +747,50 @@ fn validate_writable_paths(paths: &[PathBuf], hidden: &[MaskPath]) -> CageResult
                 MaskPath::Directory(path) | MaskPath::File(path) => path,
             };
             if writable == hidden_path || writable.starts_with(hidden_path) {
-                return Err(CageError::Policy(format!(
-                    "writable path {} is hidden by policy",
-                    writable.display()
-                )));
+                return Err(CageError::policy(
+                    writable.display().to_string(),
+                    format!(
+                        "the writable path is hidden by policy path {}",
+                        hidden_path.display()
+                    ),
+                    "choose a writable path outside the protected home path",
+                ));
             }
             if hidden_path.starts_with(writable) {
-                return Err(CageError::Policy(format!(
-                    "writable path {} would re-expose hidden path {}",
-                    writable.display(),
-                    hidden_path.display()
-                )));
+                return Err(CageError::policy(
+                    writable.display().to_string(),
+                    format!(
+                        "the writable path would re-expose hidden path {}",
+                        hidden_path.display()
+                    ),
+                    "remove the overlapping writable mount or choose a narrower build directory",
+                ));
+            }
+        }
+        for visible in read_only {
+            if writable == visible || visible.starts_with(writable) {
+                return Err(CageError::policy(
+                    writable.display().to_string(),
+                    format!(
+                        "the writable path would re-expose read-only path {}",
+                        visible.display()
+                    ),
+                    "choose a writable child directory below the read-only workspace",
+                ));
+            }
+        }
+        for private_path in private {
+            if paths_overlap(writable, private_path)
+                && !is_reexposed_below_private(writable, private_path, read_only)
+            {
+                return Err(CageError::policy(
+                    writable.display().to_string(),
+                    format!(
+                        "the writable path overlaps private filesystem {}",
+                        private_path.display()
+                    ),
+                    "choose a persistent writable path outside the private temporary filesystem",
+                ));
             }
         }
     }
@@ -621,15 +801,35 @@ fn validate_writable_paths(paths: &[PathBuf], hidden: &[MaskPath]) -> CageResult
 fn validate_read_only_paths(paths: &[PathBuf], private: &[PathBuf]) -> CageResult<()> {
     for visible in paths {
         for private_path in private {
-            if visible == private_path {
-                return Err(CageError::Policy(format!(
-                    "read-only path {} would disable its private filesystem",
-                    visible.display()
-                )));
+            if visible == private_path || private_path.starts_with(visible) {
+                return Err(CageError::policy(
+                    visible.display().to_string(),
+                    format!(
+                        "a read-only mount must not overlap private filesystem {}",
+                        private_path.display()
+                    ),
+                    "mount only the required workspace subdirectory as read-only",
+                ));
             }
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn paths_overlap(first: &Path, second: &Path) -> bool {
+    first == second || first.starts_with(second) || second.starts_with(first)
+}
+
+#[cfg(target_os = "linux")]
+fn is_reexposed_below_private(
+    path: &Path,
+    private_path: &Path,
+    read_only_paths: &[PathBuf],
+) -> bool {
+    read_only_paths
+        .iter()
+        .any(|visible| path.starts_with(visible) && visible.starts_with(private_path))
 }
 
 #[cfg(target_os = "linux")]
@@ -638,7 +838,8 @@ fn find_bwrap() -> CageResult<PathBuf> {
         let path = PathBuf::from(requested);
         if !path.is_absolute() {
             return Err(CageError::BackendUnavailable(
-                "CARGO_CAGE_BWRAP must be an absolute path".to_owned(),
+                "CARGO_CAGE_BWRAP must be an absolute path; set it to the trusted Bubblewrap executable"
+                    .to_owned(),
             ));
         }
         return validate_bwrap_path(path);
@@ -650,7 +851,7 @@ fn find_bwrap() -> CageResult<PathBuf> {
         }
     }
     Err(CageError::BackendUnavailable(
-        "Bubblewrap was not found; install the `bubblewrap` package or set CARGO_CAGE_BWRAP"
+        "Bubblewrap was not found; install the `bubblewrap` package or set CARGO_CAGE_BWRAP to a trusted absolute executable"
             .to_owned(),
     ))
 }
@@ -665,8 +866,8 @@ fn validate_bwrap_path(path: PathBuf) -> CageResult<PathBuf> {
     })?;
     if !canonical.is_file() {
         return Err(CageError::BackendUnavailable(format!(
-            "Bubblewrap path {} is not a regular file",
-            canonical.display()
+            "Bubblewrap path {} is not a regular file; install Bubblewrap or set CARGO_CAGE_BWRAP to a regular executable",
+            canonical.display(),
         )));
     }
     Ok(canonical)
@@ -683,15 +884,15 @@ fn bwrap_version(path: &Path) -> CageResult<(u32, u32, u32)> {
         })?;
     if !output.status.success() {
         return Err(CageError::BackendUnavailable(format!(
-            "{} --version failed with {:?}",
+            "{} --version failed with {:?}; install a working Bubblewrap executable",
             path.display(),
-            output.status.code()
+            output.status.code(),
         )));
     }
     parse_version(&output.stdout).ok_or_else(|| {
         CageError::BackendUnavailable(format!(
-            "could not parse Bubblewrap version from {}",
-            String::from_utf8_lossy(&output.stdout).trim()
+            "could not parse Bubblewrap version from {}; install Bubblewrap >= 0.8",
+            String::from_utf8_lossy(&output.stdout).trim(),
         ))
     })
 }
@@ -759,7 +960,10 @@ mod tests {
             hidden_paths: vec![MaskPath::Directory(PathBuf::from("/home/user/.ssh"))],
             private_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/run")],
             read_only_paths: vec![PathBuf::from("/workspace")],
-            cargo_home: None,
+            cargo_cache_paths: vec![
+                PathBuf::from("/home/user/.cargo/registry"),
+                PathBuf::from("/home/user/.cargo/git"),
+            ],
             environment: Environment {
                 set: vec![(OsString::from("CARGO_NET_OFFLINE"), OsString::from("true"))],
                 remove: vec![OsString::from("SSH_AUTH_SOCK")],
@@ -786,11 +990,30 @@ mod tests {
             "/workspace/target"
         ));
         assert!(contains_pair(&args, "--tmpfs", "/home/user/.ssh", ""));
+        assert!(contains_pair(
+            &args,
+            "--ro-bind",
+            "/home/user/.cargo/registry",
+            "/run/cargo-cage-home/registry"
+        ));
+        assert!(contains_pair(
+            &args,
+            "--ro-bind",
+            "/home/user/.cargo/git",
+            "/run/cargo-cage-home/git"
+        ));
+        assert!(!args.iter().any(|arg| arg == "config.toml"));
+        assert!(!args.iter().any(|arg| arg == "config"));
         assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(args.iter().any(|arg| arg == "--unshare-user"));
+        assert!(args.iter().any(|arg| arg == "--unshare-ipc"));
+        assert!(args.iter().any(|arg| arg == "--unshare-pid"));
+        assert!(args.iter().any(|arg| arg == "--unshare-uts"));
         assert!(args.iter().any(|arg| arg == "--disable-userns"));
         assert!(args.iter().any(|arg| arg == "--assert-userns-disabled"));
         assert!(args.iter().any(|arg| arg == "--cap-drop"));
         assert!(args.iter().any(|arg| arg == "ALL"));
+        assert!(args.iter().any(|arg| arg == "--new-session"));
         assert!(args.iter().any(|arg| arg == "--die-with-parent"));
         assert!(args.iter().any(|arg| arg == "--"));
         assert!(!args.iter().any(|arg| arg == "--share-net"));
@@ -804,10 +1027,134 @@ mod tests {
     }
 
     #[test]
+    fn policy_removals_win_over_environment_sets() {
+        let mut request = SandboxRequest::new("/bin/sh", "/");
+        request.environment = Environment {
+            set: vec![
+                (
+                    OsString::from("AWS_SECRET_ACCESS_KEY"),
+                    OsString::from("must-not-escape"),
+                ),
+                (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+            ],
+            remove: Vec::new(),
+        };
+        request.policy.remove_environment = vec![OsString::from("AWS_SECRET_ACCESS_KEY")];
+
+        let environment = merged_environment(&request);
+        assert_eq!(environment.set.len(), 1);
+        assert_eq!(environment.set[0].0, OsString::from("CARGO_NET_OFFLINE"));
+        assert_eq!(
+            environment.remove,
+            vec![OsString::from("AWS_SECRET_ACCESS_KEY")]
+        );
+
+        let plan = SandboxPlan {
+            current_dir: PathBuf::from("/"),
+            writable_paths: Vec::new(),
+            hidden_paths: Vec::new(),
+            private_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/run")],
+            read_only_paths: Vec::new(),
+            cargo_cache_paths: Vec::new(),
+            environment,
+            network: NetworkAccess::Deny,
+        };
+        let args = build_bwrap_args(&plan, Path::new("/bin/sh"), &[]);
+        assert!(!contains_pair(
+            &args,
+            "--setenv",
+            "AWS_SECRET_ACCESS_KEY",
+            "must-not-escape"
+        ));
+        assert!(contains_pair(
+            &args,
+            "--setenv",
+            "CARGO_NET_OFFLINE",
+            "true"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_cargo_cache_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let cargo_home = root.path().join("cargo-home");
+        let external = root.path().join("external");
+        fs::create_dir(&cargo_home).expect("create Cargo home");
+        fs::create_dir(&external).expect("create external cache");
+        symlink(&external, cargo_home.join("registry")).expect("create cache symlink");
+
+        let error =
+            validate_cargo_cache_paths(&cargo_home, &[], &[], &[], &[]).expect_err("symlink cache");
+        let text = error.to_string();
+        assert!(text.contains("Cargo cache"), "{text}");
+        assert!(text.contains("symlink"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_inside_cargo_cache() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let cargo_home = root.path().join("cargo-home");
+        let registry = cargo_home.join("registry");
+        let external = root.path().join("external");
+        fs::create_dir(&cargo_home).expect("create Cargo home");
+        fs::create_dir(&registry).expect("create registry cache");
+        fs::create_dir(&external).expect("create external cache");
+        symlink(&external, registry.join("escape")).expect("create nested cache symlink");
+
+        let error = validate_cargo_cache_paths(&cargo_home, &[], &[], &[], &[])
+            .expect_err("nested symlink cache");
+        let text = error.to_string();
+        assert!(text.contains("mounted Cargo caches"), "{text}");
+        assert!(text.contains("symlink"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[test]
+    fn rejects_cache_sources_overlapping_writable_or_hidden_paths() {
+        let writable_error = validate_cache_source_policy(
+            Path::new("/workspace/target/cargo-home/registry"),
+            &[PathBuf::from("/workspace/target")],
+            &[],
+            &[],
+            &[],
+        )
+        .expect_err("cache under writable target");
+        assert!(writable_error.to_string().contains("writable path"));
+
+        let hidden_error = validate_cache_source_policy(
+            Path::new("/home/user/.ssh/cargo/registry"),
+            &[],
+            &[MaskPath::Directory(PathBuf::from("/home/user/.ssh"))],
+            &[],
+            &[],
+        )
+        .expect_err("cache under hidden path");
+        assert!(hidden_error.to_string().contains("hidden path"));
+
+        validate_cache_source_policy(
+            Path::new("/tmp/workspace/cargo-home/registry"),
+            &[],
+            &[],
+            &[PathBuf::from("/tmp")],
+            &[PathBuf::from("/tmp/workspace")],
+        )
+        .expect("cache below explicitly re-exposed workspace");
+    }
+
+    #[test]
     fn rejects_writable_parent_of_hidden_path() {
         let error = validate_writable_paths(
             &[PathBuf::from("/home/user")],
             &[MaskPath::Directory(PathBuf::from("/home/user/.ssh"))],
+            &[],
+            &[],
         )
         .expect_err("writable parent would reveal hidden path");
         assert!(error.to_string().contains("re-expose"));
@@ -819,6 +1166,76 @@ mod tests {
             sandbox_setup_detail(b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n");
         assert!(detail.contains("AppArmor"));
         assert!(detail.contains("allow Bubblewrap"));
+    }
+
+    #[test]
+    fn rejects_paths_overlapping_private_filesystems() {
+        let error = validate_writable_paths(
+            &[PathBuf::from("/tmp/build")],
+            &[],
+            &[PathBuf::from("/tmp")],
+            &[],
+        )
+        .expect_err("writable path would re-expose private tmp");
+        let text = error.to_string();
+        assert!(text.contains("private filesystem"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[test]
+    fn rejects_writable_parent_of_read_only_path() {
+        let error = validate_writable_paths(
+            &[PathBuf::from("/workspace")],
+            &[],
+            &[],
+            &[PathBuf::from("/workspace/src")],
+        )
+        .expect_err("writable parent would re-expose source tree");
+        let text = error.to_string();
+        assert!(text.contains("read-only path"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[test]
+    fn allows_workspace_reexposure_below_private_tmp() {
+        validate_read_only_paths(&[PathBuf::from("/tmp/workspace")], &[PathBuf::from("/tmp")])
+            .expect("workspace child can be re-exposed");
+        validate_writable_paths(
+            &[PathBuf::from("/tmp/workspace/target")],
+            &[],
+            &[PathBuf::from("/tmp")],
+            &[PathBuf::from("/tmp/workspace")],
+        )
+        .expect("target below re-exposed workspace can be writable");
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!("cargo-cage-linux-test-{timestamp}-{id}"));
+            fs::create_dir(&path).expect("create test directory");
+            Self(fs::canonicalize(path).expect("canonical test directory"))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     fn contains_pair(args: &[OsString], option: &str, first: &str, second: &str) -> bool {

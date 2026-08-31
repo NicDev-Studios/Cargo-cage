@@ -13,13 +13,20 @@ fn linux_sandbox_acceptance_matrix() {
     simple_build_works();
     out_dir_is_writable();
     sensitive_home_path_is_hidden();
+    sensitive_environment_is_removed();
+    cargo_config_is_hidden();
     workspace_write_is_denied();
     nested_child_inherits_policy();
     network_is_denied();
     symlink_escape_is_denied();
     symlink_target_is_rejected();
+    cargo_cache_symlink_is_rejected();
+    cargo_git_cache_symlink_is_rejected();
+    cargo_cache_nested_symlink_is_rejected();
+    cargo_cache_special_file_is_rejected();
     external_cargo_subcommand_works();
     missing_backend_fails_closed();
+    old_backend_fails_closed();
     defective_backend_fails_closed();
 }
 
@@ -46,6 +53,44 @@ fn sensitive_home_path_is_hidden() {
     let output = run_cage_with_env(&fixture, &[("CAGE_TEST_ACTION", "home-read")]);
     assert_policy_failure(&output);
     assert!(fake_home.join(".ssh/fixture-secret").is_file());
+}
+
+fn sensitive_environment_is_removed() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let mut command = base_command(&fixture);
+    command
+        .env("CAGE_TEST_ACTION", "secret-env")
+        .env("AWS_SECRET_ACCESS_KEY", "fixture-secret")
+        .env("GITHUB_TOKEN", "fixture-token")
+        .env("CAGE_TEST_TOKEN", "fixture-token")
+        .env("CAGE_TEST_PASSWORD", "fixture-password")
+        .env("SSH_AUTH_SOCK", "/tmp/fixture-agent.sock");
+    let output = command.output().expect("run cargo-cage");
+    assert_policy_failure(&output);
+    let text = output_text(&output);
+    assert!(!text.contains("fixture-secret"), "{text}");
+    assert!(!text.contains("fixture-token"), "{text}");
+    assert!(!text.contains("fixture-password"), "{text}");
+}
+
+fn cargo_config_is_hidden() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let cargo_home = test_cargo_home(&fixture);
+    fs::write(
+        cargo_home.join("config.toml"),
+        b"[registries.private]\ntoken = \"fixture-secret\"\n",
+    )
+    .expect("write Cargo config fixture");
+
+    let output = run_cage_with_cargo_home(
+        &fixture,
+        &cargo_home,
+        &[("CAGE_TEST_ACTION", "cargo-config-read")],
+    );
+    assert_policy_failure(&output);
+    let text = output_text(&output);
+    assert!(text.contains("Cargo configuration"), "{text}");
+    assert!(!text.contains("fixture-secret"), "{text}");
 }
 
 fn workspace_write_is_denied() {
@@ -128,6 +173,73 @@ fn symlink_target_is_rejected() {
     );
 }
 
+fn cargo_cache_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let cargo_home = test_cargo_home(&fixture);
+    let external = fixture.file("external-cache");
+    fs::create_dir(&external).expect("create external cache");
+    fs::write(external.join("cache-secret"), b"must stay outside").expect("write cache secret");
+    symlink(&external, cargo_home.join("registry")).expect("create cache symlink");
+
+    let output = run_cage_with_cargo_home(&fixture, &cargo_home, &[]);
+    assert_cache_setup_failure(&output);
+    assert!(external.join("cache-secret").is_file());
+    assert!(!fixture.file("target").exists());
+}
+
+fn cargo_cache_nested_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let cargo_home = test_cargo_home(&fixture);
+    let registry = cargo_home.join("registry");
+    fs::create_dir(&registry).expect("create registry cache");
+    let external = fixture.file("nested-external-cache");
+    fs::create_dir(&external).expect("create nested external cache");
+    fs::write(external.join("cache-secret"), b"must stay outside")
+        .expect("write nested cache secret");
+    symlink(&external, registry.join("escape")).expect("create nested cache symlink");
+
+    let output = run_cage_with_cargo_home(&fixture, &cargo_home, &[]);
+    assert_cache_setup_failure(&output);
+    assert!(external.join("cache-secret").is_file());
+    assert!(!fixture.file("target").exists());
+}
+
+fn cargo_git_cache_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let cargo_home = test_cargo_home(&fixture);
+    let external = fixture.file("external-git-cache");
+    fs::create_dir(&external).expect("create external git cache");
+    fs::write(external.join("cache-secret"), b"must stay outside").expect("write git cache secret");
+    symlink(&external, cargo_home.join("git")).expect("create git cache symlink");
+
+    let output = run_cage_with_cargo_home(&fixture, &cargo_home, &[]);
+    assert_cache_setup_failure(&output);
+    assert!(external.join("cache-secret").is_file());
+    assert!(!fixture.file("target").exists());
+}
+
+fn cargo_cache_special_file_is_rejected() {
+    use std::os::unix::net::UnixListener;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let cargo_home = test_cargo_home(&fixture);
+    let git = cargo_home.join("git");
+    fs::create_dir(&git).expect("create git cache");
+    let socket_path = git.join("cache.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("create cache socket");
+
+    let output = run_cage_with_cargo_home(&fixture, &cargo_home, &[]);
+    assert_cache_setup_failure(&output);
+    assert!(socket_path.exists());
+    assert!(!fixture.file("target").exists());
+}
+
 fn external_cargo_subcommand_works() {
     let fixture = materialize("simple-build").expect("simple fixture");
     let cargo = cargo_program();
@@ -146,7 +258,7 @@ fn external_cargo_subcommand_works() {
                 .expect("UTF-8 manifest path"),
         ])
         .env("PATH", prepend_path(binary_directory))
-        .env("CARGO_HOME", host_cargo_home())
+        .env("CARGO_HOME", test_cargo_home(&fixture))
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR");
     apply_rustup_home(&mut command);
@@ -197,6 +309,31 @@ fn defective_backend_fails_closed() {
     assert!(!fixture.file("target").exists());
 }
 
+fn old_backend_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let old_bwrap = fixture.file("old-bwrap");
+    fs::write(
+        &old_bwrap,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'bubblewrap 0.7.0\\n'\n  exit 0\nfi\nexit 0\n",
+    )
+    .expect("write old Bubblewrap");
+    let mut permissions = fs::metadata(&old_bwrap)
+        .expect("old Bubblewrap metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&old_bwrap, permissions).expect("make old Bubblewrap executable");
+
+    let mut command = base_command(&fixture);
+    command.env("CARGO_CAGE_BWRAP", &old_bwrap);
+    let output = command.output().expect("run cargo-cage");
+    assert!(!output.status.success());
+    let text = output_text(&output);
+    assert!(text.contains("too old") && text.contains("0.8"), "{text}");
+    assert!(!fixture.file("target").exists());
+}
+
 fn run_cage(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
     run_cage_with_env(fixture, extra)
 }
@@ -209,14 +346,28 @@ fn run_cage_with_env(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
     command.output().expect("run cargo-cage")
 }
 
+fn run_cage_with_cargo_home(
+    fixture: &Fixture,
+    cargo_home: &Path,
+    extra: &[(&str, &str)],
+) -> Output {
+    let mut command = base_command(fixture);
+    command.env("CARGO_HOME", cargo_home);
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command.output().expect("run cargo-cage")
+}
+
 fn base_command(fixture: &Fixture) -> Command {
+    let cargo_home = test_cargo_home(fixture);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cage"));
     command
         .current_dir(fixture.path())
         .args(["build", "--manifest-path"])
         .arg(fixture.file("Cargo.toml"))
         .env("HOME", fixture.file("fake-home"))
-        .env("CARGO_HOME", host_cargo_home())
+        .env("CARGO_HOME", cargo_home)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR");
     apply_rustup_home(&mut command);
@@ -227,12 +378,10 @@ fn cargo_program() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
 }
 
-fn host_cargo_home() -> OsString {
-    env::var_os("CARGO_HOME").unwrap_or_else(|| {
-        PathBuf::from(env::var_os("HOME").expect("test HOME"))
-            .join(".cargo")
-            .into_os_string()
-    })
+fn test_cargo_home(fixture: &Fixture) -> PathBuf {
+    let path = fixture.file("cargo-home");
+    fs::create_dir_all(&path).expect("create fixture Cargo home");
+    path
 }
 
 fn apply_rustup_home(command: &mut Command) {
@@ -265,6 +414,21 @@ fn assert_policy_failure(output: &Output) {
         text.contains("cargo-cage: Cargo build failed inside the Linux sandbox"),
         "{text}"
     );
+}
+
+fn assert_cache_setup_failure(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "unexpected success: {}",
+        output_text(output)
+    );
+    let text = output_text(output);
+    assert!(text.contains("Cargo cache"), "{text}");
+    assert!(
+        text.contains("symlink") || text.contains("regular files"),
+        "{text}"
+    );
+    assert!(text.contains("remedy:"), "{text}");
 }
 
 fn output_text(output: &Output) -> String {

@@ -56,6 +56,7 @@ where
     let workspace = workspace_from_output(&locate_outcome.stdout, &current_dir)?;
     let target_dir = paths::target_dir_arg(&build_args, &current_dir, &workspace)?;
     let target_dir = prepare_target_dir(target_dir, &workspace)?;
+    let build_dir = prepare_target_dir(target_dir.join("build"), &workspace)?;
     let lockfile = prepare_lockfile(&workspace)?;
 
     let mut sandbox_policy = policy::cargo_policy(true)?;
@@ -80,7 +81,7 @@ where
         ),
         (
             OsString::from("CARGO_BUILD_BUILD_DIR"),
-            target_dir.join("build").into_os_string(),
+            build_dir.into_os_string(),
         ),
         (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
         (OsString::from("TMPDIR"), OsString::from("/tmp")),
@@ -133,7 +134,10 @@ fn resolve_cargo(current_dir: &Path) -> CageResult<PathBuf> {
     }
 
     let path = env::var_os("PATH").ok_or_else(|| {
-        CageError::BackendUnavailable("CARGO is not set and PATH is unavailable".to_owned())
+        CageError::BackendUnavailable(
+            "CARGO is not set and PATH is unavailable; set PATH or CARGO to a trusted Cargo executable"
+                .to_owned(),
+        )
     })?;
     for directory in env::split_paths(&path) {
         let directory = if directory.is_absolute() {
@@ -148,8 +152,8 @@ fn resolve_cargo(current_dir: &Path) -> CageResult<PathBuf> {
     }
 
     Err(CageError::BackendUnavailable(format!(
-        "could not find Cargo executable `{}`",
-        requested_path.display()
+        "could not find Cargo executable `{}`; install Cargo or set CARGO to a trusted executable",
+        requested_path.display(),
     )))
 }
 
@@ -162,8 +166,8 @@ fn validate_executable_path(path: PathBuf) -> CageResult<PathBuf> {
     })?;
     if !metadata.is_file() {
         return Err(CageError::BackendUnavailable(format!(
-            "Cargo executable {} is not a regular file",
-            path.display()
+            "Cargo executable {} is not a regular file; set CARGO to a regular Cargo executable",
+            path.display(),
         )));
     }
     Ok(path)
@@ -174,7 +178,8 @@ fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBu
     let manifest = output.trim();
     if manifest.is_empty() || manifest.contains('\n') || manifest.contains('\r') {
         return Err(CageError::SandboxSetup(
-            "Cargo returned an invalid workspace manifest path".to_owned(),
+            "Cargo returned an invalid workspace manifest path; verify the manifest and rerun the build"
+                .to_owned(),
         ));
     }
 
@@ -194,15 +199,19 @@ fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBu
         )
     })?;
     if manifest.file_name() != Some(OsStr::new("Cargo.toml")) {
-        return Err(CageError::Policy(format!(
-            "Cargo workspace discovery returned a non-Cargo.toml path: {}",
-            manifest.display()
-        )));
+        return Err(CageError::policy(
+            manifest.display().to_string(),
+            "workspace discovery must return a Cargo.toml path",
+            "run cargo-cage from a Cargo workspace or pass a valid --manifest-path",
+        ));
     }
-    manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| CageError::Policy("workspace manifest has no parent directory".to_owned()))
+    manifest.parent().map(Path::to_path_buf).ok_or_else(|| {
+        CageError::policy(
+            manifest.display().to_string(),
+            "the workspace manifest must have a parent directory",
+            "use a valid Cargo workspace manifest path",
+        )
+    })
 }
 
 fn output_detail(output: &[u8]) -> String {

@@ -6,9 +6,30 @@ use std::path::PathBuf;
 pub type CageResult<T> = Result<T, CageError>;
 
 #[derive(Debug)]
+pub struct PolicyViolation {
+    pub subject: String,
+    pub rule: String,
+    pub remedy: String,
+}
+
+impl PolicyViolation {
+    pub fn new(
+        subject: impl Into<String>,
+        rule: impl Into<String>,
+        remedy: impl Into<String>,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            rule: rule.into(),
+            remedy: remedy.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum CageError {
     InvalidInvocation(String),
-    Policy(String),
+    Policy(PolicyViolation),
     UnsupportedPlatform,
     BackendUnavailable(String),
     SandboxSetup(String),
@@ -27,6 +48,14 @@ pub enum CageError {
 }
 
 impl CageError {
+    pub fn policy(
+        subject: impl Into<String>,
+        rule: impl Into<String>,
+        remedy: impl Into<String>,
+    ) -> Self {
+        Self::Policy(PolicyViolation::new(subject, rule, remedy))
+    }
+
     pub fn io(context: impl Into<String>, source: io::Error) -> Self {
         Self::Io {
             context: context.into(),
@@ -39,9 +68,13 @@ impl fmt::Display for CageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInvocation(message) => write!(f, "invalid invocation: {message}"),
-            Self::Policy(message) => write!(f, "sandbox policy error: {message}"),
+            Self::Policy(violation) => write!(
+                f,
+                "sandbox policy error for {}: {}; remedy: {}",
+                violation.subject, violation.rule, violation.remedy
+            ),
             Self::UnsupportedPlatform => {
-                write!(f, "cargo-cage v0.1 supports Linux only")
+                write!(f, "cargo-cage v0.2 supports Linux only")
             }
             Self::BackendUnavailable(message) => {
                 write!(f, "Linux sandbox backend unavailable: {message}")
@@ -68,5 +101,24 @@ impl std::error::Error for CageError {
             Self::ProcessSpawn { source, .. } | Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_errors_explain_subject_rule_and_remedy() {
+        let error = CageError::policy(
+            "/workspace/target-link",
+            "writable target paths must not contain symlinks",
+            "replace the symlink with a real directory",
+        );
+        let text = error.to_string();
+        assert!(text.contains("/workspace/target-link"));
+        assert!(text.contains("must not contain symlinks"));
+        assert!(text.contains("remedy:"));
+        assert!(text.contains("replace the symlink"));
     }
 }

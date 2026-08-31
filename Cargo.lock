@@ -4,29 +4,29 @@ version = 4
 
 [[package]]
 name = "cage-cargo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cage-core",
 ]
 
 [[package]]
 name = "cage-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "cage-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cage-core",
 ]
 
 [[package]]
 name = "cage-testkit"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "cargo-cage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cage-cargo",
  "cage-core",

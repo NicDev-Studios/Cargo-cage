@@ -4,18 +4,25 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| CageError::Policy("HOME is not set".to_owned()))?;
+    let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CageError::policy(
+            "HOME",
+            "HOME must be set to construct the sandbox policy",
+            "set HOME to an absolute home directory before running cargo-cage",
+        )
+    })?;
     if !home.is_absolute() {
-        return Err(CageError::Policy(
-            "HOME must be an absolute path".to_owned(),
+        return Err(CageError::policy(
+            home.display().to_string(),
+            "HOME must be an absolute path",
+            "set HOME to the absolute path of the user home directory",
         ));
     }
 
+    let default_cargo_home = home.join(".cargo");
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".cargo"));
+        .unwrap_or_else(|| default_cargo_home.clone());
     let mut hidden_paths = Vec::new();
     for name in [
         ".ssh",
@@ -29,8 +36,17 @@ pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
     ] {
         hidden_paths.push(home.join(name));
     }
-    hidden_paths.push(cargo_home.join("credentials"));
-    hidden_paths.push(cargo_home.join("credentials.toml"));
+    let cargo_homes = if cargo_home == default_cargo_home {
+        vec![cargo_home]
+    } else {
+        vec![cargo_home, default_cargo_home]
+    };
+    for cargo_home in cargo_homes {
+        hidden_paths.push(cargo_home.join("credentials"));
+        hidden_paths.push(cargo_home.join("credentials.toml"));
+        hidden_paths.push(cargo_home.join("config"));
+        hidden_paths.push(cargo_home.join("config.toml"));
+    }
 
     let private_paths = if main_build {
         vec![PathBuf::from("/tmp"), PathBuf::from("/run")]
@@ -80,9 +96,50 @@ fn sensitive_environment_names() -> Vec<OsString> {
 
 fn is_sensitive_environment_name(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
+        let name = name.to_ascii_uppercase();
         name.starts_with("AWS_")
-            || name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_TOKEN")
+            || name == "TOKEN"
+            || name.ends_with("_TOKEN")
+            || name.ends_with("_TOKENS")
+            || name == "PASSWORD"
             || name.ends_with("_PASSWORD")
+            || name.ends_with("_PASS")
+            || name == "SECRET"
             || name.ends_with("_SECRET")
+            || name.ends_with("_SECRET_KEY")
+            || name == "API_KEY"
+            || name.ends_with("_API_KEY")
+            || name == "ACCESS_KEY"
+            || name.ends_with("_ACCESS_KEY")
+            || name.starts_with("SSH_")
+            || name.starts_with("GPG_")
+            || name.ends_with("_AGENT")
+            || name.ends_with("_AGENT_INFO")
+            || name.ends_with("_AGENT_PID")
+            || name.ends_with("_AUTH_SOCK")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sensitive_environment_name;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn identifies_secret_and_agent_environment_names() {
+        for name in [
+            "AWS_PROFILE",
+            "SERVICE_TOKEN",
+            "SERVICE_PASSWORD",
+            "SERVICE_SECRET_KEY",
+            "SERVICE_API_KEY",
+            "SSH_AUTH_SOCK",
+            "CUSTOM_AGENT_INFO",
+        ] {
+            assert!(is_sensitive_environment_name(OsStr::new(name)), "{name}");
+        }
+        assert!(!is_sensitive_environment_name(OsStr::new(
+            "CARGO_TARGET_DIR"
+        )));
+    }
 }

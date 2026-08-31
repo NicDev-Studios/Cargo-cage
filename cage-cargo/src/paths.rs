@@ -75,10 +75,11 @@ pub fn target_dir_arg(
 
 pub fn prepare_target_dir(path: PathBuf, workspace: &Path) -> CageResult<PathBuf> {
     if !path.is_absolute() {
-        return Err(CageError::Policy(format!(
-            "target directory must be absolute after resolution: {}",
-            path.display()
-        )));
+        return Err(CageError::policy(
+            path.display().to_string(),
+            "the target directory must be absolute after resolution",
+            "pass an absolute --target-dir or use a target directory inside the workspace",
+        ));
     }
     let workspace = fs::canonicalize(workspace).map_err(|error| {
         CageError::io(
@@ -89,10 +90,11 @@ pub fn prepare_target_dir(path: PathBuf, workspace: &Path) -> CageResult<PathBuf
     let path = lexical_normalize(&path);
     let containment_path = canonicalize_with_missing_components(&path)?;
     if containment_path == workspace || !containment_path.starts_with(&workspace) {
-        return Err(CageError::Policy(format!(
-            "target directory {} is outside the workspace",
-            containment_path.display()
-        )));
+        return Err(CageError::policy(
+            containment_path.display().to_string(),
+            "the target directory must be inside the canonical workspace; paths outside the workspace are forbidden",
+            "choose --target-dir below the workspace directory",
+        ));
     }
     create_directory_without_symlinks(&path)?;
     let target = fs::canonicalize(&path).map_err(|error| {
@@ -102,10 +104,11 @@ pub fn prepare_target_dir(path: PathBuf, workspace: &Path) -> CageResult<PathBuf
         )
     })?;
     if target == workspace || !target.starts_with(&workspace) {
-        return Err(CageError::Policy(format!(
-            "target directory {} is outside the workspace",
-            target.display()
-        )));
+        return Err(CageError::policy(
+            target.display().to_string(),
+            "the target directory must be inside the canonical workspace; paths outside the workspace are forbidden",
+            "choose --target-dir below the workspace directory",
+        ));
     }
     Ok(target)
 }
@@ -151,16 +154,18 @@ pub fn prepare_lockfile(workspace: &Path) -> CageResult<PathBuf> {
 
 fn validate_lockfile(path: &Path, metadata: &fs::Metadata) -> CageResult<()> {
     if metadata.file_type().is_symlink() {
-        return Err(CageError::Policy(format!(
-            "workspace lockfile {} must not be a symlink",
-            path.display()
-        )));
+        return Err(CageError::policy(
+            path.display().to_string(),
+            "the workspace Cargo.lock must not be a symlink",
+            "replace it with a regular file before running cargo-cage",
+        ));
     }
     if !metadata.is_file() {
-        return Err(CageError::Policy(format!(
-            "workspace lockfile {} is not a regular file",
-            path.display()
-        )));
+        return Err(CageError::policy(
+            path.display().to_string(),
+            "the workspace Cargo.lock must be a regular file",
+            "replace the lockfile with a regular file before running cargo-cage",
+        ));
     }
     Ok(())
 }
@@ -179,16 +184,18 @@ fn create_directory_without_symlinks(path: &Path) -> CageResult<()> {
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    return Err(CageError::Policy(format!(
-                        "target path contains symlink component {}",
-                        current.display()
-                    )));
+                    return Err(CageError::policy(
+                        current.display().to_string(),
+                        "the writable target path must not contain symlink components",
+                        "replace the symlink with a real directory",
+                    ));
                 }
                 if !metadata.is_dir() {
-                    return Err(CageError::Policy(format!(
-                        "target path component {} is not a directory",
-                        current.display()
-                    )));
+                    return Err(CageError::policy(
+                        current.display().to_string(),
+                        "every target path component must be a directory",
+                        "remove the conflicting file and retry with a directory path",
+                    ));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -233,10 +240,11 @@ fn canonicalize_with_missing_components(path: &Path) -> CageResult<PathBuf> {
     let mut missing = Vec::new();
     while !existing.exists() {
         let Some(name) = existing.file_name() else {
-            return Err(CageError::Policy(format!(
-                "could not find an existing parent for target {}",
-                path.display()
-            )));
+            return Err(CageError::policy(
+                path.display().to_string(),
+                "the target path must have an existing parent",
+                "create the workspace directory before running cargo-cage",
+            ));
         };
         missing.push(name.to_os_string());
         existing.pop();
@@ -345,5 +353,55 @@ mod tests {
         let error =
             prepare_target_dir(workspace.join("target"), &workspace).expect_err("symlink target");
         assert!(error.to_string().contains("symlink") || error.to_string().contains("outside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_build_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        fs::create_dir(&workspace).expect("create workspace");
+        fs::create_dir(&outside).expect("create outside");
+        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+        let target = prepare_target_dir(workspace.join("target"), &workspace)
+            .expect("create target directory");
+        symlink(&outside, target.join("build")).expect("create build symlink");
+
+        let error = prepare_target_dir(target.join("build"), &workspace)
+            .expect_err("symlinked build directory");
+        let text = error.to_string();
+        assert!(
+            text.contains("symlink") || text.contains("outside"),
+            "{text}"
+        );
+        assert!(outside.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_lockfile() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let workspace_path = root.path().join("workspace");
+        let external = root.path().join("external-lock");
+        fs::create_dir(&workspace_path).expect("create workspace");
+        fs::write(&external, b"must remain untouched").expect("create external lock target");
+        let workspace = fs::canonicalize(workspace_path).expect("canonical workspace");
+        symlink(&external, workspace.join("Cargo.lock")).expect("create lockfile symlink");
+
+        let error = prepare_lockfile(&workspace).expect_err("symlinked lockfile");
+        let text = error.to_string();
+        assert!(
+            text.contains("Cargo.lock") && text.contains("symlink"),
+            "{text}"
+        );
+        assert_eq!(
+            fs::read(&external).expect("read external lock target"),
+            b"must remain untouched"
+        );
     }
 }

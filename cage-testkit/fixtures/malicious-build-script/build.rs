@@ -12,12 +12,49 @@ fn main() {
 
     match env::var("CAGE_TEST_ACTION").as_deref() {
         Ok("home-read") => home_read(),
+        Ok("secret-env") => secret_environment(),
+        Ok("cargo-config-read") => cargo_config_read(),
         Ok("workspace-write") => workspace_write(),
         Ok("network") => network_access(),
         Ok("nested-write") => nested_write(),
         Ok("symlink-escape") => symlink_escape(),
         Ok(action) => panic!("unknown CAGE_TEST_ACTION={action}"),
         Err(_) => {}
+    }
+}
+
+fn secret_environment() -> ! {
+    let protected = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GITHUB_TOKEN",
+        "CAGE_TEST_TOKEN",
+        "CAGE_TEST_PASSWORD",
+        "SSH_AUTH_SOCK",
+        "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+    ];
+    if let Some(name) = protected
+        .iter()
+        .find(|name| env::var_os(name).is_some())
+    {
+        panic!("CAGE_POLICY_BYPASSED: protected environment variable {name} was visible");
+    }
+    panic!("CAGE_POLICY_DENIED: protected environment variables were removed");
+}
+
+fn cargo_config_read() -> ! {
+    let cargo_home = PathBuf::from(env::var_os("CARGO_HOME").expect("CARGO_HOME is set"));
+    let config = cargo_home.join("config.toml");
+    match fs::read_to_string(&config) {
+        Ok(_) => panic!(
+            "CAGE_POLICY_BYPASSED: Cargo configuration was visible at {}",
+            config.display()
+        ),
+        Err(error) => panic!(
+            "CAGE_POLICY_DENIED: could not read Cargo configuration at {}: {error}",
+            config.display()
+        ),
     }
 }
 
