@@ -29,6 +29,8 @@ const MIN_BWRAP_PATCH: u32 = 0;
 #[cfg(target_os = "linux")]
 const CARGO_HOME_IN_SANDBOX: &str = "/run/cargo-cage-home";
 #[cfg(target_os = "linux")]
+const FD_SCRUBBER_SHELL: &str = "/bin/bash";
+#[cfg(target_os = "linux")]
 const NAMESPACE_PREFLIGHT_OUTPUT: &[u8] = b"cargo-cage-namespace-preflight-ok\n";
 #[cfg(target_os = "linux")]
 const NAMESPACE_PREFLIGHT: &str = r#"set -eu
@@ -672,7 +674,10 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
     }
 
     command.push(OsString::from("--"));
-    command.push(PathBuf::from("/bin/sh").into_os_string());
+    // dash (Ubuntu's /bin/sh) only accepts short file-descriptor numbers in
+    // redirections. Bash handles the high descriptors Cargo's jobserver may
+    // provide, while the script itself remains fixed and argument-safe.
+    command.push(PathBuf::from(FD_SCRUBBER_SHELL).into_os_string());
     command.push(OsString::from("-c"));
     command.push(OsString::from(FD_SCRUBBER));
     command.push(OsString::from("cargo-cage-fd-scrubber"));
@@ -1708,7 +1713,7 @@ mod tests {
             .iter()
             .position(|arg| arg == "--")
             .expect("bubblewrap command separator");
-        assert_eq!(args[command_separator + 1], "/bin/sh");
+        assert_eq!(args[command_separator + 1], FD_SCRUBBER_SHELL);
         assert_eq!(args[command_separator + 2], "-c");
         assert_eq!(args[command_separator + 3], FD_SCRUBBER);
         assert!(!args.iter().any(|arg| arg == "--share-net"));
