@@ -5,6 +5,19 @@ edition = "2024"
 rust-version = "1.85"
 build = "build.rs"
 
+[features]
+home-read = []
+home-socket-read = []
+secret-env = []
+cargo-config-read = []
+workspace-write = []
+network = []
+nested-write = []
+symlink-escape = []
+runtime-path-read = []
+fd-read = []
+parent-death = []
+
 [[bin]]
 name = "cage-malicious-build-script"
 path = "src/main.rs"

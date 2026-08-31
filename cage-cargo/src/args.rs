@@ -93,7 +93,7 @@ pub fn is_help_request(args: &[OsString]) -> bool {
 }
 
 pub fn help_text() -> &'static str {
-    "cargo-cage v0.3.0\n\nUSAGE:\n    cargo cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo cage doctor [--verbose]\n    cargo-cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo-cage doctor [--verbose]\n\nCargo runs in an experimental Linux sandbox. Network access is denied,\nsensitive home paths are hidden, and persistent writes are limited to target\nand Cargo.lock. Dependencies must be available locally; use `cargo fetch`\nseparately before running an offline command.\n\n`doctor` checks Bubblewrap, namespaces, workspace paths, and Cargo caches\nwithout modifying the project.\n"
+    "cargo-cage v0.3.0\n\nUSAGE:\n    cargo cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo cage doctor [--verbose]\n    cargo-cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo-cage doctor [--verbose]\n\nCargo runs in an experimental Linux sandbox. Network access is denied,\nHOME is private, the child environment uses a fixed allowlist, and persistent\nwrites are limited to target and Cargo.lock. Dependencies must be available\nlocally; use `cargo fetch` separately before running an offline command.\n\n`doctor` checks Bubblewrap, namespaces, workspace paths, toolchain paths, and\nCargo caches without modifying the project.\n"
 }
 
 #[cfg(test)]

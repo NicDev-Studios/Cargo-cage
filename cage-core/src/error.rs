@@ -74,7 +74,7 @@ impl fmt::Display for CageError {
                 violation.subject, violation.rule, violation.remedy
             ),
             Self::UnsupportedPlatform => {
-                write!(f, "cargo-cage v0.3 supports Linux only")
+                write!(f, "cargo-cage currently supports Linux only")
             }
             Self::BackendUnavailable(message) => {
                 write!(f, "Linux sandbox backend unavailable: {message}")

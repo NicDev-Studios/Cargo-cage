@@ -1,7 +1,7 @@
 use cage_core::{CageError, CageResult, NetworkAccess, SandboxPolicy};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
     let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
@@ -16,6 +16,13 @@ pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
             home.display().to_string(),
             "HOME must be an absolute path",
             "set HOME to the absolute path of the user home directory",
+        ));
+    }
+    if home == Path::new(std::path::MAIN_SEPARATOR_STR) {
+        return Err(CageError::policy(
+            home.display().to_string(),
+            "HOME must not be the filesystem root",
+            "set HOME to a real user home directory",
         ));
     }
 
@@ -48,11 +55,14 @@ pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
         hidden_paths.push(cargo_home.join("config.toml"));
     }
 
-    let private_paths = if main_build {
-        vec![PathBuf::from("/tmp"), PathBuf::from("/run")]
-    } else {
-        Vec::new()
-    };
+    let mut private_paths = vec![home];
+    if main_build {
+        private_paths.extend([
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/tmp"),
+            PathBuf::from("/run"),
+        ]);
+    }
 
     Ok(SandboxPolicy {
         network: NetworkAccess::Deny,
@@ -103,10 +113,15 @@ fn is_sensitive_environment_name(name: &OsStr) -> bool {
             || name.ends_with("_TOKENS")
             || name == "PASSWORD"
             || name.ends_with("_PASSWORD")
+            || name == "PASS"
             || name.ends_with("_PASS")
             || name == "SECRET"
             || name.ends_with("_SECRET")
             || name.ends_with("_SECRET_KEY")
+            || name == "CREDENTIAL"
+            || name.ends_with("_CREDENTIAL")
+            || name == "PRIVATE_KEY"
+            || name.ends_with("_PRIVATE_KEY")
             || name == "API_KEY"
             || name.ends_with("_API_KEY")
             || name == "ACCESS_KEY"
@@ -131,7 +146,10 @@ mod tests {
             "AWS_PROFILE",
             "SERVICE_TOKEN",
             "SERVICE_PASSWORD",
+            "PASS",
             "SERVICE_SECRET_KEY",
+            "SERVICE_PRIVATE_KEY",
+            "SERVICE_CREDENTIAL",
             "SERVICE_API_KEY",
             "SSH_AUTH_SOCK",
             "CUSTOM_AGENT_INFO",

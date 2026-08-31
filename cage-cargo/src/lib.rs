@@ -9,9 +9,75 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub use args::{CargoCommand, CargoInvocation, help_text, is_help_request, parse_invocation};
 pub use paths::{inspect_lockfile, prepare_lockfile, prepare_target_dir, validate_target_dir};
+
+const SAFE_ENVIRONMENT_NAMES: &[&str] = &[
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_ADDRESS",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_IDENTIFICATION",
+    "LC_MEASUREMENT",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NAME",
+    "LC_NUMERIC",
+    "LC_PAPER",
+    "LC_TELEPHONE",
+    "LC_TIME",
+    "TERM",
+    "COLORTERM",
+    "COLUMNS",
+    "LINES",
+    "CARGO_TERM_COLOR",
+    "CARGO_TERM_VERBOSE",
+    "CARGO_TERM_PROGRESS_WHEN",
+    "CARGO_INCREMENTAL",
+    "CARGO_BUILD_JOBS",
+    "CARGO_BUILD_TARGET",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_ENCODED_RUSTDOCFLAGS",
+    "CC",
+    "CXX",
+    "AR",
+    "RANLIB",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "PKG_CONFIG",
+    "PKG_CONFIG_PATH",
+    "PKG_CONFIG_LIBDIR",
+    "PKG_CONFIG_SYSROOT_DIR",
+];
+
+const STANDARD_RUNTIME_DIRECTORIES: &[&str] = &[
+    "/usr/bin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/local/sbin",
+    "/bin",
+    "/sbin",
+];
+
+#[derive(Clone, Debug)]
+struct Toolchain {
+    cargo: PathBuf,
+    rustc: PathBuf,
+    rustdoc: Option<PathBuf>,
+    sysroot: PathBuf,
+    home: PathBuf,
+    path: OsString,
+    read_only_paths: Vec<PathBuf>,
+}
 
 /// Run the supported Cargo subcommand through the supplied platform backend.
 pub fn run<I>(args: I, backend: &dyn SandboxBackend) -> CageResult<i32>
@@ -33,7 +99,8 @@ fn run_cargo(
 ) -> CageResult<i32> {
     let current_dir = canonical_current_dir()?;
     let cargo = resolve_cargo(&current_dir)?;
-    let workspace = locate_workspace(&cargo, &current_dir, &cargo_args, backend)?;
+    let toolchain = resolve_toolchain(&cargo, &current_dir, command == CargoCommand::Doc)?;
+    let workspace = locate_workspace(&toolchain, &current_dir, &cargo_args, backend)?;
     let target_dir = paths::target_dir_arg(&cargo_args, &current_dir, &workspace)?;
     let target_dir = prepare_target_dir(target_dir, &workspace)?;
     let build_dir = prepare_target_dir(target_dir.join("build"), &workspace)?;
@@ -44,6 +111,9 @@ fn run_cargo(
     if current_dir != workspace {
         sandbox_policy.read_only_paths.push(current_dir.clone());
     }
+    sandbox_policy
+        .read_only_paths
+        .extend(toolchain.read_only_paths.iter().cloned());
     sandbox_policy.writable_paths.push(target_dir.clone());
     sandbox_policy.writable_paths.push(lockfile.clone());
 
@@ -51,21 +121,25 @@ fn run_cargo(
     command_args.push(OsString::from(command.as_str()));
     command_args.extend(cargo_args);
 
-    let mut request = SandboxRequest::new(&cargo, &current_dir);
+    let mut request = SandboxRequest::new(&toolchain.cargo, &current_dir);
     request.args = command_args;
     request.policy = sandbox_policy;
-    request.environment = cargo_environment(vec![
-        (
-            OsString::from("CARGO_TARGET_DIR"),
-            target_dir.clone().into_os_string(),
-        ),
-        (
-            OsString::from("CARGO_BUILD_BUILD_DIR"),
-            build_dir.into_os_string(),
-        ),
-        (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
-        (OsString::from("TMPDIR"), OsString::from("/tmp")),
-    ]);
+    request.environment = cargo_environment(
+        &toolchain,
+        &current_dir,
+        vec![
+            (
+                OsString::from("CARGO_TARGET_DIR"),
+                target_dir.clone().into_os_string(),
+            ),
+            (
+                OsString::from("CARGO_BUILD_BUILD_DIR"),
+                build_dir.into_os_string(),
+            ),
+            (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+            (OsString::from("TMPDIR"), OsString::from("/tmp")),
+        ],
+    );
     request.output = OutputMode::Inherit;
 
     let outcome = backend.run(&request)?;
@@ -82,7 +156,7 @@ fn run_cargo(
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
     );
     eprintln!(
-        "cargo-cage: policy active: network denied, sensitive home paths hidden, and persistent writes limited to {} and {}.",
+        "cargo-cage: policy active: clean allowlisted environment, private HOME, network denied, and persistent writes limited to {} and {}.",
         target_dir.display(),
         lockfile.display()
     );
@@ -119,7 +193,21 @@ fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
         }
     };
 
-    let workspace = match locate_workspace(&cargo, &current_dir, &[], backend) {
+    let toolchain = match resolve_toolchain(&cargo, &current_dir, true) {
+        Ok(toolchain) => {
+            println!("  OK   Rust toolchain: {}", toolchain.sysroot.display());
+            println!("  OK   sandbox environment: clean allowlist");
+            println!("  OK   home directory: private mount");
+            println!("  OK   runtime filesystem: explicit read-only mounts");
+            toolchain
+        }
+        Err(error) => {
+            println!("  FAIL Rust toolchain: {error}");
+            return Ok(1);
+        }
+    };
+
+    let workspace = match locate_workspace(&toolchain, &current_dir, &[], backend) {
         Ok(path) => {
             println!("  OK   workspace: {}", path.display());
             path
@@ -210,6 +298,9 @@ fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
             if current_dir != workspace {
                 policy.read_only_paths.push(current_dir.clone());
             }
+            policy
+                .read_only_paths
+                .extend(toolchain.read_only_paths.iter().cloned());
             if let Some((target, true)) = target.as_ref() {
                 policy.writable_paths.push(target.clone());
             }
@@ -229,10 +320,14 @@ fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
         let mut probe = SandboxRequest::new("/bin/sh", &current_dir);
         probe.args = vec![OsString::from("-c"), OsString::from("exit 0")];
         probe.policy = policy;
-        probe.environment = cargo_environment(vec![
-            (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
-            (OsString::from("TMPDIR"), OsString::from("/tmp")),
-        ]);
+        probe.environment = cargo_environment(
+            &toolchain,
+            &current_dir,
+            vec![
+                (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+                (OsString::from("TMPDIR"), OsString::from("/tmp")),
+            ],
+        );
         probe.output = OutputMode::Capture;
         match backend.run(&probe) {
             Ok(outcome) if outcome.status.successfully_exited() => {
@@ -289,12 +384,12 @@ fn cargo_cache_present() -> bool {
 }
 
 fn locate_workspace(
-    cargo: &Path,
+    toolchain: &Toolchain,
     current_dir: &Path,
     cargo_args: &[OsString],
     backend: &dyn SandboxBackend,
 ) -> CageResult<PathBuf> {
-    let mut locate_request = SandboxRequest::new(cargo, current_dir);
+    let mut locate_request = SandboxRequest::new(&toolchain.cargo, current_dir);
     locate_request.args.push(OsString::from("locate-project"));
     locate_request.args.push(OsString::from("--workspace"));
     locate_request.args.push(OsString::from("--message-format"));
@@ -303,8 +398,16 @@ fn locate_workspace(
         locate_request.args.push(OsString::from("--manifest-path"));
         locate_request.args.push(manifest_path);
     }
-    locate_request.policy = policy::cargo_policy(false)?;
-    locate_request.environment = cargo_environment(Vec::new());
+    let mut policy = policy::cargo_policy(false)?;
+    policy.read_only_paths.push(current_dir.to_path_buf());
+    if let Some(manifest_parent) = manifest_parent_path(cargo_args, current_dir)? {
+        policy.read_only_paths.push(manifest_parent);
+    }
+    policy
+        .read_only_paths
+        .extend(toolchain.read_only_paths.iter().cloned());
+    locate_request.policy = policy;
+    locate_request.environment = cargo_environment(toolchain, current_dir, Vec::new());
     locate_request.output = OutputMode::Capture;
 
     let locate_outcome = backend.run(&locate_request)?;
@@ -319,16 +422,369 @@ fn locate_workspace(
     workspace_from_output(&locate_outcome.stdout, current_dir)
 }
 
-fn cargo_environment(set: Vec<(OsString, OsString)>) -> Environment {
-    Environment {
-        set,
-        remove: Vec::new(),
+fn cargo_environment(
+    toolchain: &Toolchain,
+    current_dir: &Path,
+    overrides: Vec<(OsString, OsString)>,
+) -> Environment {
+    let mut environment = Environment::clean();
+    for (key, value) in safe_host_environment() {
+        environment = environment.set(key, value);
+    }
+    environment = environment
+        .set("HOME", toolchain.home.clone())
+        .set("PATH", toolchain.path.clone())
+        .set("PWD", current_dir.as_os_str())
+        .set("RUSTC", toolchain.rustc.clone());
+    if let Some(rustdoc) = &toolchain.rustdoc {
+        environment = environment.set("RUSTDOC", rustdoc.clone());
+    }
+    for (key, value) in overrides {
+        environment = environment.set(key, value);
+    }
+    environment
+}
+
+fn safe_host_environment() -> Vec<(OsString, OsString)> {
+    let mut values = Vec::new();
+    for (key, value) in env::vars_os() {
+        if is_safe_environment_name(&key) {
+            values.push((key, value));
+        }
+    }
+    values
+}
+
+fn is_safe_environment_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| SAFE_ENVIRONMENT_NAMES.contains(&name))
+}
+
+fn manifest_parent_path(args: &[OsString], current_dir: &Path) -> CageResult<Option<PathBuf>> {
+    let Some(value) = paths::manifest_path_arg(args)? else {
+        return Ok(None);
+    };
+    let manifest = PathBuf::from(value);
+    let manifest = if manifest.is_absolute() {
+        manifest
+    } else {
+        current_dir.join(manifest)
+    };
+    let manifest = canonical_existing_path_without_symlinks(&manifest, "manifest path")?;
+    if !fs::metadata(&manifest).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(CageError::policy(
+            manifest.display().to_string(),
+            "the manifest path must be a regular file",
+            "pass an existing real Cargo.toml path",
+        ));
+    }
+    Ok(manifest.parent().map(Path::to_path_buf))
+}
+
+fn resolve_toolchain(
+    cargo: &Path,
+    current_dir: &Path,
+    require_rustdoc: bool,
+) -> CageResult<Toolchain> {
+    let home = canonical_home()?;
+    let host_rustc = resolve_program("rustc", "RUSTC", current_dir)?;
+    let sysroot = query_sysroot(&host_rustc, &home)?;
+    let sysroot_bin = sysroot.join("bin");
+
+    let rustc = select_toolchain_program("rustc", &host_rustc, &sysroot_bin, true)?;
+    let rustdoc = if sysroot_bin.join("rustdoc").is_file() {
+        Some(select_toolchain_program(
+            "rustdoc",
+            &sysroot_bin.join("rustdoc"),
+            &sysroot_bin,
+            true,
+        )?)
+    } else if require_rustdoc {
+        let host_rustdoc = resolve_program("rustdoc", "RUSTDOC", current_dir)?;
+        Some(select_toolchain_program(
+            "rustdoc",
+            &host_rustdoc,
+            &sysroot_bin,
+            true,
+        )?)
+    } else {
+        None
+    };
+
+    let cargo = if is_rustup_proxy(cargo) {
+        select_toolchain_program("cargo", cargo, &sysroot_bin, true)?
+    } else {
+        cargo.to_path_buf()
+    };
+
+    let (path, path_directories) = sandbox_path(
+        &home,
+        current_dir,
+        [&cargo, &rustc].into_iter().chain(rustdoc.as_ref()),
+    )?;
+    let mut read_only_paths = toolchain_mount_paths(
+        &sysroot,
+        [&cargo, &rustc].into_iter().chain(rustdoc.as_ref()),
+    )?;
+    for directory in path_directories {
+        if !read_only_paths.contains(&directory) {
+            read_only_paths.push(directory);
+        }
+    }
+
+    Ok(Toolchain {
+        cargo,
+        rustc,
+        rustdoc,
+        sysroot,
+        home,
+        path,
+        read_only_paths,
+    })
+}
+
+fn canonical_home() -> CageResult<PathBuf> {
+    let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CageError::policy(
+            "HOME",
+            "HOME must be set to construct the sandbox environment",
+            "set HOME to an absolute user home directory before running cargo-cage",
+        )
+    })?;
+    if !home.is_absolute() {
+        return Err(CageError::policy(
+            home.display().to_string(),
+            "HOME must be an absolute path",
+            "set HOME to the absolute path of the user home directory",
+        ));
+    }
+    if home == Path::new(std::path::MAIN_SEPARATOR_STR) {
+        return Err(CageError::policy(
+            home.display().to_string(),
+            "HOME must not be the filesystem root",
+            "set HOME to a real user home directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&home).map_err(|error| {
+        CageError::io(
+            format!("could not inspect home directory {}", home.display()),
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CageError::policy(
+            home.display().to_string(),
+            "HOME must be an existing real directory without symlink resolution",
+            "set HOME to an existing real user home directory",
+        ));
+    }
+    canonical_existing_path_without_symlinks(&home, "home directory")
+}
+
+fn select_toolchain_program(
+    name: &str,
+    fallback: &Path,
+    sysroot_bin: &Path,
+    required: bool,
+) -> CageResult<PathBuf> {
+    let candidate = sysroot_bin.join(name);
+    if candidate.is_file() {
+        validate_executable_path(candidate)
+    } else if required && is_rustup_proxy(fallback) {
+        Err(CageError::BackendUnavailable(format!(
+            "the selected Rust sysroot has no {name} executable; install the complete Rust toolchain or select a system toolchain"
+        )))
+    } else if required {
+        validate_executable_path(fallback.to_path_buf())
+    } else {
+        Ok(fallback.to_path_buf())
     }
 }
 
+fn query_sysroot(rustc: &Path, home: &Path) -> CageResult<PathBuf> {
+    let mut command = Command::new(rustc);
+    command
+        .env_clear()
+        .env("HOME", home)
+        .args(["--print", "sysroot"]);
+    if let Some(rustup_home) = env::var_os("RUSTUP_HOME") {
+        command.env("RUSTUP_HOME", rustup_home);
+    }
+    if let Some(rustup_toolchain) = env::var_os("RUSTUP_TOOLCHAIN") {
+        command.env("RUSTUP_TOOLCHAIN", rustup_toolchain);
+    }
+    let output = command.output().map_err(|source| CageError::ProcessSpawn {
+        program: rustc.to_path_buf(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CageError::BackendUnavailable(format!(
+            "{} --print sysroot failed with {:?}; install or select a working Rust toolchain",
+            rustc.display(),
+            output.status.code(),
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text.trim();
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        return Err(CageError::BackendUnavailable(
+            "Rust returned an invalid sysroot path; select a working Rust toolchain".to_owned(),
+        ));
+    }
+    let sysroot = PathBuf::from(value);
+    if !sysroot.is_absolute() {
+        return Err(CageError::BackendUnavailable(format!(
+            "Rust returned a relative sysroot {}; select a working Rust toolchain",
+            sysroot.display()
+        )));
+    }
+    let sysroot = canonical_existing_path_without_symlinks(&sysroot, "Rust sysroot")?;
+    if !fs::metadata(&sysroot).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(CageError::BackendUnavailable(format!(
+            "Rust sysroot {} is not a directory; select a working Rust toolchain",
+            sysroot.display()
+        )));
+    }
+    Ok(sysroot)
+}
+
+fn is_rustup_proxy(path: &Path) -> bool {
+    fs::canonicalize(path)
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name == OsStr::new("rustup")))
+        .unwrap_or(false)
+}
+
+fn toolchain_mount_paths<I>(sysroot: &Path, executables: I) -> CageResult<Vec<PathBuf>>
+where
+    I: IntoIterator,
+    I::Item: AsRef<Path>,
+{
+    let mut paths = Vec::new();
+    if sysroot != Path::new(std::path::MAIN_SEPARATOR_STR) {
+        paths.push(sysroot.to_path_buf());
+    }
+    for executable in executables {
+        let executable = executable.as_ref();
+        let parent = executable.parent().ok_or_else(|| {
+            CageError::BackendUnavailable(format!(
+                "toolchain executable {} has no parent directory",
+                executable.display()
+            ))
+        })?;
+        let parent = fs::canonicalize(parent).map_err(|error| {
+            CageError::io(
+                format!(
+                    "could not canonicalize toolchain directory {}",
+                    parent.display()
+                ),
+                error,
+            )
+        })?;
+        if !fs::metadata(&parent).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(CageError::BackendUnavailable(format!(
+                "toolchain path {} is not a directory; select a working Rust toolchain",
+                parent.display()
+            )));
+        }
+        if parent != Path::new(std::path::MAIN_SEPARATOR_STR) && !paths.contains(&parent) {
+            paths.push(parent);
+        }
+    }
+    Ok(paths)
+}
+
+fn sandbox_path<I>(
+    home: &Path,
+    current_dir: &Path,
+    executables: I,
+) -> CageResult<(OsString, Vec<PathBuf>)>
+where
+    I: IntoIterator,
+    I::Item: AsRef<Path>,
+{
+    let required_directories = executables
+        .into_iter()
+        .filter_map(|executable| executable.as_ref().parent().map(Path::to_path_buf))
+        .filter_map(|path| {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                current_dir.join(path)
+            };
+            fs::canonicalize(path).ok()
+        })
+        .collect::<Vec<_>>();
+    let mut paths = required_directories.clone();
+    for runtime in STANDARD_RUNTIME_DIRECTORIES {
+        let Ok(runtime) = fs::canonicalize(runtime) else {
+            continue;
+        };
+        if fs::metadata(&runtime).is_ok_and(|metadata| metadata.is_dir())
+            && !paths.contains(&runtime)
+        {
+            paths.push(runtime);
+        }
+    }
+    if let Some(host_path) = env::var_os("PATH") {
+        for path in env::split_paths(&host_path) {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                current_dir.join(path)
+            };
+            let Ok(path) = fs::canonicalize(path) else {
+                continue;
+            };
+            if !fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                continue;
+            }
+            if is_private_host_path(&path, home) && !required_directories.contains(&path) {
+                continue;
+            }
+            if !is_standard_runtime_path(&path) && !required_directories.contains(&path) {
+                continue;
+            }
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Err(CageError::BackendUnavailable(
+            "could not construct a safe PATH for the Rust toolchain; set PATH to existing toolchain directories"
+                .to_owned(),
+        ));
+    }
+    let path = env::join_paths(paths.clone()).map_err(|error| {
+        CageError::BackendUnavailable(format!(
+            "could not construct a safe toolchain PATH: {error}"
+        ))
+    })?;
+    Ok((path, paths))
+}
+
+fn is_private_host_path(path: &Path, home: &Path) -> bool {
+    path.starts_with(home)
+        || ["/tmp", "/var/tmp", "/run"].iter().any(|private| {
+            let private = Path::new(private);
+            path == private || path.starts_with(private)
+        })
+}
+
+fn is_standard_runtime_path(path: &Path) -> bool {
+    STANDARD_RUNTIME_DIRECTORIES
+        .iter()
+        .map(Path::new)
+        .any(|runtime| path == runtime || path.starts_with(runtime))
+}
+
 fn resolve_cargo(current_dir: &Path) -> CageResult<PathBuf> {
-    let requested = env::var_os("CARGO").or_else(|| Some(OsString::from("cargo")));
-    let requested = requested.expect("cargo fallback is always present");
+    resolve_program("cargo", "CARGO", current_dir)
+}
+
+fn resolve_program(name: &str, variable: &str, current_dir: &Path) -> CageResult<PathBuf> {
+    let requested = env::var_os(variable).unwrap_or_else(|| OsString::from(name));
     let requested_path = PathBuf::from(requested);
 
     if requested_path.is_absolute() || requested_path.components().count() > 1 {
@@ -342,8 +798,9 @@ fn resolve_cargo(current_dir: &Path) -> CageResult<PathBuf> {
 
     let path = env::var_os("PATH").ok_or_else(|| {
         CageError::BackendUnavailable(
-            "CARGO is not set and PATH is unavailable; set PATH or CARGO to a trusted Cargo executable"
-                .to_owned(),
+            format!(
+                "{variable} is not set and PATH is unavailable; set PATH or {variable} to a trusted {name} executable"
+            ),
         )
     })?;
     for directory in env::split_paths(&path) {
@@ -359,25 +816,32 @@ fn resolve_cargo(current_dir: &Path) -> CageResult<PathBuf> {
     }
 
     Err(CageError::BackendUnavailable(format!(
-        "could not find Cargo executable `{}`; install Cargo or set CARGO to a trusted executable",
+        "could not find {name} executable `{}`; install {name} or set {variable} to a trusted executable",
         requested_path.display(),
     )))
 }
 
 fn validate_executable_path(path: PathBuf) -> CageResult<PathBuf> {
-    let metadata = fs::metadata(&path).map_err(|error| {
+    let canonical = fs::canonicalize(&path).map_err(|error| {
         CageError::io(
-            format!("could not resolve Cargo executable {}", path.display()),
+            format!("could not resolve executable {}", path.display()),
             error,
         )
     })?;
-    if !metadata.is_file() {
+    if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
         return Err(CageError::BackendUnavailable(format!(
-            "Cargo executable {} is not a regular file; set CARGO to a regular Cargo executable",
+            "executable {} is not a regular file; select a trusted executable",
             path.display(),
         )));
     }
-    Ok(path)
+    // Rustup dispatches based on argv[0]. Preserve a rustup proxy path so
+    // `rustc` and `cargo` keep their proxy names; the selected sysroot
+    // executable is resolved before the sandbox is started.
+    if canonical.file_name() == Some(OsStr::new("rustup")) {
+        Ok(path)
+    } else {
+        Ok(canonical)
+    }
 }
 
 fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBuf> {
@@ -396,15 +860,14 @@ fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBu
     } else {
         current_dir.join(manifest)
     };
-    let manifest = fs::canonicalize(&manifest).map_err(|error| {
-        CageError::io(
-            format!(
-                "could not resolve workspace manifest {}",
-                manifest.display()
-            ),
-            error,
-        )
-    })?;
+    let manifest = canonical_existing_path_without_symlinks(&manifest, "workspace manifest")?;
+    if !fs::metadata(&manifest).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(CageError::policy(
+            manifest.display().to_string(),
+            "workspace discovery must return a regular Cargo.toml file",
+            "run cargo-cage from a workspace with a real Cargo.toml manifest",
+        ));
+    }
     if manifest.file_name() != Some(OsStr::new("Cargo.toml")) {
         return Err(CageError::policy(
             manifest.display().to_string(),
@@ -417,6 +880,59 @@ fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBu
             manifest.display().to_string(),
             "the workspace manifest must have a parent directory",
             "use a valid Cargo workspace manifest path",
+        )
+    })
+}
+
+fn canonical_existing_path_without_symlinks(path: &Path, label: &str) -> CageResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(CageError::policy(
+            path.display().to_string(),
+            format!("the {label} must be an absolute path"),
+            "pass an absolute path or run cargo-cage from the intended workspace",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(CageError::policy(
+            path.display().to_string(),
+            format!("the {label} must not contain parent-directory traversal"),
+            "pass the canonical path without `..` components",
+        ));
+    }
+
+    let mut current = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            CageError::io(
+                format!("could not inspect {label} component {}", current.display()),
+                error,
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CageError::policy(
+                path.display().to_string(),
+                format!("the {label} must not contain symlink components"),
+                "replace the symlink with a real path and retry",
+            ));
+        }
+        if components.peek().is_some() && !metadata.is_dir() {
+            return Err(CageError::policy(
+                current.display().to_string(),
+                format!("{label} parent components must be directories"),
+                "replace the conflicting file with a directory and retry",
+            ));
+        }
+    }
+
+    fs::canonicalize(path).map_err(|error| {
+        CageError::io(
+            format!("could not canonicalize {label} {}", path.display()),
+            error,
         )
     })
 }
@@ -604,5 +1120,118 @@ mod tests {
         assert_eq!(backend.calls.borrow().len(), 2);
         assert!(!workspace.join("Cargo.lock").exists());
         assert!(!workspace.join("target").exists());
+    }
+
+    #[test]
+    fn cargo_environment_starts_clean_and_sets_toolchain_values() {
+        let toolchain = Toolchain {
+            cargo: PathBuf::from("/toolchain/bin/cargo"),
+            rustc: PathBuf::from("/toolchain/bin/rustc"),
+            rustdoc: Some(PathBuf::from("/toolchain/bin/rustdoc")),
+            sysroot: PathBuf::from("/toolchain"),
+            home: PathBuf::from("/home/test"),
+            path: OsString::from("/toolchain/bin"),
+            read_only_paths: vec![PathBuf::from("/toolchain")],
+        };
+
+        let environment = cargo_environment(&toolchain, Path::new("/workspace"), Vec::new());
+        assert!(!environment.inherit);
+        assert!(
+            environment
+                .set
+                .iter()
+                .any(|(key, value)| key == "HOME" && value == "/home/test")
+        );
+        assert!(
+            environment
+                .set
+                .iter()
+                .any(|(key, value)| key == "PATH" && value == "/toolchain/bin")
+        );
+        assert!(
+            environment
+                .set
+                .iter()
+                .any(|(key, value)| key == "RUSTC" && value == "/toolchain/bin/rustc")
+        );
+        assert!(
+            environment
+                .set
+                .iter()
+                .any(|(key, value)| key == "RUSTDOC" && value == "/toolchain/bin/rustdoc")
+        );
+        assert!(!environment.set.iter().any(|(key, _)| key == "CARGO_HOME"));
+    }
+
+    #[test]
+    fn environment_allowlist_excludes_host_control_and_secret_names() {
+        for name in [
+            "USER",
+            "LANG",
+            "CARGO_BUILD_JOBS",
+            "RUSTFLAGS",
+            "PKG_CONFIG_PATH",
+            "LC_ALL",
+        ] {
+            assert!(is_safe_environment_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "RUSTUP_HOME",
+            "AWS_SECRET_ACCESS_KEY",
+            "CAGE_TEST_ARBITRARY_SECRET",
+            "SSH_AUTH_SOCK",
+            "LC_SECRET",
+        ] {
+            assert!(!is_safe_environment_name(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn host_path_filter_keeps_private_runtime_roots_hidden() {
+        let home = Path::new("/home/test");
+        for path in [
+            "/home/test/bin",
+            "/tmp/tools",
+            "/var/tmp/tools",
+            "/run/agent",
+        ] {
+            assert!(is_private_host_path(Path::new(path), home), "{path}");
+        }
+        assert!(!is_private_host_path(Path::new("/usr/bin"), home));
+    }
+
+    #[test]
+    fn path_allowlist_keeps_only_standard_runtime_or_required_directories() {
+        assert!(is_standard_runtime_path(Path::new("/usr/bin")));
+        assert!(is_standard_runtime_path(Path::new("/usr/local/bin/tool")));
+        assert!(!is_standard_runtime_path(Path::new("/opt/custom-bin")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_manifest_symlinks_are_rejected_before_mounting() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let external = workspace.join("external-Cargo.toml");
+        fs::write(&external, fs::read(workspace.join("Cargo.toml")).unwrap())
+            .expect("write external manifest");
+        let link = workspace.join("linked-Cargo.toml");
+        symlink(&external, &link).expect("create manifest symlink");
+
+        let error = manifest_parent_path(
+            &[OsString::from("--manifest-path"), link.into_os_string()],
+            &workspace,
+        )
+        .expect_err("symlinked manifest");
+        let text = error.to_string();
+        assert!(text.contains("manifest path"), "{text}");
+        assert!(text.contains("symlink"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
     }
 }

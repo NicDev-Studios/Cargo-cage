@@ -2,8 +2,9 @@
 
 ## Scope
 
-This document describes the intended boundary of the experimental Linux v0.3
-workflow.
+This document describes the intended boundary of the experimental Linux
+workflow. The v0.4 hardening work is being developed against the current 0.3
+package and is not released until Ubuntu CI has passed.
 It is not proof that the boundary holds against an unknown kernel, Bubblewrap
 bug, or toolchain vulnerability.
 
@@ -30,30 +31,40 @@ The relevant assets are:
 
 ## Trusted components
 
-The Linux kernel, host security policy, Bubblewrap, Cargo, Rustc, and the
-user's selected toolchain are trusted components for this release. The host
-policy must permit Bubblewrap to create the namespaces required by the backend.
+The Linux kernel, host security policy, Bubblewrap 0.12.0 or newer, Cargo,
+Rustc, and the user's selected toolchain are trusted components for this
+release. The host policy must permit Bubblewrap to create the namespaces
+required by the backend.
+Older Bubblewrap releases are outside the supported trust boundary because of
+the upstream [GHSA-pxhw-h44j-8pfx setup vulnerability](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx).
 
 ## Enforced boundary
 
 Before each Cargo operation, the backend runs a Bubblewrap preflight and checks
 that the requested mount, user, PID, IPC, UTS, and network namespaces are
-actually different from the parent where applicable. The host filesystem is
-mounted read-only. The canonical workspace `target` directory and
-`Cargo.lock` are then explicitly mounted read-write.
+actually different from the parent where applicable. A small read-only Linux
+runtime plus the explicitly selected project/toolchain paths is mounted; the
+host root is not mounted wholesale. The canonical workspace `target`
+directory and `Cargo.lock` are then explicitly mounted read-write.
 
-`/tmp` and `/run` are private tmpfs filesystems. `TMPDIR` points to the private
-`/tmp`. If the workspace itself lives below a private path, it is re-mounted
-read-only so Cargo can still read its sources.
+`HOME`, `/tmp`, `/var/tmp`, and `/run` are private filesystems. `TMPDIR` points
+to the private `/tmp`. If the workspace or a required Rust toolchain lives below a
+private path, it is re-mounted read-only so Cargo can still use it.
 
-Cargo runs with `CARGO_NET_OFFLINE=true` and a private `CARGO_HOME`. Existing
+Cargo runs with `CARGO_NET_OFFLINE=true`, a private `CARGO_HOME`, and a clean
+environment populated only from a fixed Cargo/Rust allowlist. Existing
 `registry` and `git` caches are mounted read-only only after checking the cache
 root, rejecting symlinks and special files, and checking that the source does
-not overlap a writable, hidden, or private path. Cargo `config` and
-`config.toml` are not mounted. Credentials files are not mounted.
+not overlap a writable or hidden path. Cache sources may live below a private
+host path because they are mounted at the private Cargo home destination.
+Cargo `config` and `config.toml` are deliberately not mounted. Credentials
+files are not mounted. A project-local Cargo config inside the read-only
+workspace remains visible and is treated as untrusted project input.
 
-Known credential and agent variables are removed. The list is intentionally not
-complete and must not be treated as general-purpose secret scrubbing.
+Known credential and agent variables are removed, and the normal Cargo path
+does not inherit arbitrary host variables at all. The allowlist still includes
+user-controlled build configuration such as compiler flags and is not
+general-purpose secret scrubbing.
 
 Paths are checked and canonicalized before they are mounted. Writable target
 paths, the lockfile, and paths used for sandbox mounts must not rely on unsafe
@@ -77,6 +88,10 @@ separate `cargo fetch`.
   `target`, fail with a normal operating-system error.
 - Child processes, test binaries, and compiler helpers inherit the mount and
   namespace boundary.
+- Non-selected host paths such as `/sys`, `/boot`, and the host `/var` tree are
+  not part of the runtime filesystem view.
+- Extra inherited file descriptors are closed by Bubblewrap before the child
+  starts, and existing writable-tree symlinks and special files are rejected.
 - A malformed or unsafe Cargo cache stops the build before Cargo starts.
 - A missing, old, or non-working Bubblewrap backend stops the build before the
   real Cargo process runs.
@@ -86,10 +101,10 @@ separate `cargo fetch`.
 - Kernel, Bubblewrap, Cargo, Rustc, or toolchain vulnerabilities.
 - Resource exhaustion, fork bombs, long-running builds, or other denial of
   service attacks.
-- Every host file. Non-masked files remain readable, and the home-path list is
-  not complete.
+- The selected Linux runtime directories, workspace files, and toolchain files
+  are intentionally readable.
 - Secrets in environment variables that are not removed, compiler flags,
-  readable project files, or hard-link aliases.
+  readable project files, or hard-link aliases inside the target tree.
 - Data that an untrusted build writes inside `target`.
 - Safe execution of generated artifacts.
 - A seccomp policy or syscall-level audit record.

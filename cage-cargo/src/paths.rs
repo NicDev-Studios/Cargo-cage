@@ -2,6 +2,8 @@ use cage_core::{CageError, CageResult};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 pub fn manifest_path_arg(args: &[OsString]) -> CageResult<Option<OsString>> {
@@ -117,6 +119,16 @@ pub fn validate_target_dir(path: &Path, workspace: &Path) -> CageResult<PathBuf>
         )
     })?;
     let original_path = path;
+    if original_path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(CageError::policy(
+            original_path.display().to_string(),
+            "the target directory must not contain parent-directory traversal",
+            "pass the canonical target path without `..` components",
+        ));
+    }
     let normalized = lexical_normalize(original_path);
     let containment_path = canonicalize_with_missing_components(&normalized)?;
     if containment_path == workspace || !containment_path.starts_with(&workspace) {
@@ -257,6 +269,14 @@ fn validate_lockfile(path: &Path, metadata: &fs::Metadata) -> CageResult<()> {
             path.display().to_string(),
             "the workspace Cargo.lock must be a regular file",
             "replace the lockfile with a regular file before running cargo-cage",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.nlink() > 1 {
+        return Err(CageError::policy(
+            path.display().to_string(),
+            "the workspace Cargo.lock must not be a hardlink to another file",
+            "replace it with a single-link regular file before running cargo-cage",
         ));
     }
     Ok(())
@@ -466,10 +486,41 @@ mod tests {
             .join("outside");
         let error = prepare_target_dir(target, &workspace).expect_err("traversal target");
         assert!(
-            error.to_string().contains("outside the workspace"),
+            error.to_string().contains("parent-directory traversal"),
             "{error}"
         );
         assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn rejects_target_traversal_even_when_it_normalizes_inside_workspace() {
+        let root = TestDirectory::new();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+
+        let error = validate_target_dir(&workspace.join("build/../target"), &workspace)
+            .expect_err("syntactic traversal");
+        let text = error.to_string();
+        assert!(text.contains("parent-directory traversal"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hardlinked_lockfile() {
+        let root = TestDirectory::new();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let external = root.path().join("external-lockfile");
+        fs::write(&external, b"lockfile").expect("write external lockfile");
+        fs::hard_link(&external, workspace.join("Cargo.lock")).expect("create lockfile hardlink");
+
+        let error = inspect_lockfile(&workspace).expect_err("hardlinked lockfile");
+        let text = error.to_string();
+        assert!(text.contains("hardlink"), "{text}");
+        assert!(text.contains("Cargo.lock"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
     }
 
     #[cfg(unix)]
@@ -507,7 +558,7 @@ mod tests {
         let error = prepare_target_dir(path, &workspace).expect_err("symlink traversal");
         let text = error.to_string();
         assert!(
-            text.contains("symlink") || text.contains("outside"),
+            text.contains("symlink") || text.contains("parent-directory traversal"),
             "{text}"
         );
         assert!(!outside.join("escape").exists());

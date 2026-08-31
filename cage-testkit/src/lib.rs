@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct Fixture {
     root: PathBuf,
+    cleanup_paths: RefCell<Vec<PathBuf>>,
 }
 
 impl Fixture {
@@ -20,10 +22,33 @@ impl Fixture {
     pub fn file(&self, name: impl AsRef<Path>) -> PathBuf {
         self.root.join(name)
     }
+
+    /// Create a temporary directory beside the fixture, outside the workspace
+    /// that will be mounted read-only by cargo-cage.
+    pub fn temporary_dir(&self, name: &str) -> io::Result<PathBuf> {
+        let root_name = self
+            .root
+            .file_name()
+            .ok_or_else(|| io::Error::other("fixture root has no file name"))?;
+        let path = self
+            .root
+            .parent()
+            .ok_or_else(|| io::Error::other("fixture root has no parent"))?
+            .join(format!("{}-{name}", root_name.to_string_lossy()));
+        fs::create_dir_all(&path)?;
+        let mut cleanup_paths = self.cleanup_paths.borrow_mut();
+        if !cleanup_paths.contains(&path) {
+            cleanup_paths.push(path.clone());
+        }
+        Ok(path)
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        for path in self.cleanup_paths.get_mut().drain(..) {
+            let _ = fs::remove_dir_all(path);
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -52,7 +77,10 @@ pub fn materialize(name: &str) -> io::Result<Fixture> {
     ));
     fs::create_dir(&destination)?;
     copy_directory(&source, &destination)?;
-    Ok(Fixture { root: destination })
+    Ok(Fixture {
+        root: destination,
+        cleanup_paths: RefCell::new(Vec::new()),
+    })
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {

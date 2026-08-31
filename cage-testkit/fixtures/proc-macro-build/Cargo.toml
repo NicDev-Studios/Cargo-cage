@@ -1,0 +1,15 @@
+[package]
+name = "cage-proc-macro-build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+cage-fixture-proc-macro = { path = "proc-macro" }
+
+[[bin]]
+name = "cage-proc-macro-build"
+path = "src/main.rs"
+
+[workspace]
+members = ["proc-macro"]

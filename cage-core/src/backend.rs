@@ -53,7 +53,7 @@ impl SandboxRequest {
             program: program.into(),
             args: Vec::new(),
             current_dir: current_dir.into(),
-            environment: Environment::default(),
+            environment: Environment::clean(),
             policy: SandboxPolicy::default(),
             output: OutputMode::Inherit,
         }
@@ -68,4 +68,14 @@ impl SandboxRequest {
 /// OS-specific implementation of the process sandbox.
 pub trait SandboxBackend {
     fn run(&self, request: &SandboxRequest) -> CageResult<SandboxOutcome>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_requests_default_to_a_clean_environment() {
+        assert!(!SandboxRequest::new("/bin/sh", "/").environment.inherit);
+    }
 }

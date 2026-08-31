@@ -77,6 +77,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -88,9 +93,7 @@ jobs:
           fi
 
       - name: Install sandbox runtime
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes bubblewrap
+        run: bash .github/scripts/install-bubblewrap.sh
 
       - name: Install cargo-cage from crates.io
         env:

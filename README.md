@@ -14,28 +14,41 @@ processes inside a Bubblewrap sandbox.
 This is a practical extra boundary around a local build. It is not a complete
 security guarantee and it is not a replacement for a hardened build service.
 
-## What v0.3 does
+## Current security boundary
 
 - Denies network access by default and forces Cargo offline mode.
-- Mounts the host filesystem read-only.
+- Starts from Bubblewrap's empty mount namespace and adds only the required
+  read-only Linux runtime, workspace, validated caches, and Rust toolchain
+  paths. The host root is not mounted wholesale.
 - Allows persistent writes only to the canonical workspace `target` directory
   and the workspace `Cargo.lock`.
 - Keeps normal Cargo output and `OUT_DIR` working under `target`.
-- Provides private, throwaway `/tmp` and `/run` filesystems.
-- Hides common sensitive paths such as `~/.ssh`, `~/.aws`, `~/.config`, and
-  Cargo credentials.
-- Removes common credential and agent environment variables. A policy removal
-  always wins over an environment value supplied to the child.
+- Provides private, throwaway `/tmp`, `/var/tmp`, and `/run` filesystems.
+- Starts Cargo with an empty environment and a small fixed Cargo/Rust
+  allowlist. `HOME`, `PATH`, `CARGO_HOME`, `RUSTUP_HOME`, credentials, agent
+  variables, and arbitrary project environment variables are not inherited.
+- Keeps common sensitive-path masks as an additional defence. A policy
+  removal always wins over an environment value supplied to the child.
 - Uses a private `CARGO_HOME`. Only validated `registry` and `git` caches are
-  mounted read-only. Cargo `config` and `config.toml` are intentionally not
-  mounted because they may contain credentials or credential providers.
-- Rejects symlinked or special-file Cargo cache entries, and cache sources that
-  overlap writable, hidden, or private paths, before starting Cargo.
+  mounted read-only. Cache roots must be absolute, real, and symlink-free;
+  symlinks and special files inside a cache stop the build. User Cargo
+  `config` and `config.toml` are intentionally not mounted because they may
+  contain credentials or credential providers. A project-local config inside
+  the workspace remains a project input.
+- Re-checks workspace, target, lockfile, cache, hidden, and toolchain paths
+  before mounting them. Symlink, traversal, type, and overlap errors fail
+  closed.
 - Refuses to run if Bubblewrap is missing, too old, or cannot activate the
   requested namespaces. There is no unsandboxed fallback.
+- Requires Bubblewrap `0.12.0+`; older releases are rejected because of a
+  known [sandbox-setup escape](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx).
 - Supports `build`, `check`, `test`, and `doc` through the same sandbox policy.
 - Provides `cargo cage doctor` to check the current project and host without
   creating or changing project files.
+
+This hardening is developed as the next major release, but the package version
+remains `0.3.0` until the required Ubuntu CI run is green. There is no v0.4
+release to install yet.
 
 ## Requirements and installation
 
@@ -51,7 +64,8 @@ crates.io:
 workspace-private crate.
 
 The reference environment is Ubuntu 24.04 x86_64 with unprivileged user
-namespaces enabled and Bubblewrap 0.8 or newer.
+namespaces enabled and Bubblewrap 0.12.0 or newer. Older Bubblewrap releases
+are rejected because they contain known sandbox-setup vulnerabilities.
 
 The host security policy must also allow Bubblewrap to create the namespaces
 it needs. On Ubuntu 24.04, AppArmor can deny this even when the kernel setting
@@ -61,10 +75,15 @@ the policy globally.
 
 ```sh
 sudo apt-get install bubblewrap
+bwrap --version  # must report 0.12.0 or newer
 cargo install --path cargo-cage --locked
 ```
 
-Once a crates.io release is available, the CLI can be installed with:
+If the distribution package is older than 0.12.0, install the distribution's
+security update or a checksum-verified upstream build. `cargo-cage` refuses to
+run with older Bubblewrap and never falls back to an unsandboxed Cargo process.
+
+When a crates.io release is available, the CLI can be installed with:
 
 ```sh
 cargo install cargo-cage --locked --version 0.3.0
@@ -82,8 +101,9 @@ cargo cage build
 ```
 
 `cargo-cage` never fetches automatically and never opens the sandbox network
-for that purpose. If a cache is missing, Cargo keeps its native offline error
-and `cargo-cage` explains that `cargo fetch` must be run separately.
+for that purpose. Existing caches are inspected before they are mounted. If a
+cache is missing, Cargo keeps its native offline error and `cargo-cage` explains
+that `cargo fetch` must be run separately.
 
 ## Usage
 
@@ -116,9 +136,8 @@ can write into the source tree:
 
 ```sh
 cd cage-testkit/fixtures/malicious-build-script
-CAGE_TEST_ACTION=workspace-write \
-CAGE_TEST_WRITE_PATH="$PWD/build-script-write.txt" \
-cargo build
+cargo build --features workspace-write || true
+test -e build-script-write.txt
 ```
 
 With the cage, the source tree is read-only. Cargo keeps its native diagnostic
@@ -126,9 +145,7 @@ and `cargo-cage` adds the active policy context:
 
 ```sh
 rm -f build-script-write.txt
-CAGE_TEST_ACTION=workspace-write \
-CAGE_TEST_WRITE_PATH="$PWD/build-script-write.txt" \
-cargo cage build
+cargo cage build --features workspace-write || true
 test ! -e build-script-write.txt
 ```
 
@@ -147,12 +164,16 @@ audit every denied syscall.
 The threat model is deliberately narrow. The tool does not protect against
 kernel, Bubblewrap, Cargo, Rustc, or toolchain vulnerabilities. It does not
 solve resource exhaustion, fork bombs, side channels, or every possible secret
-in the environment and filesystem. Most of the host filesystem remains
-readable.
+in the environment and filesystem. Selected system runtime directories and
+project/toolchain mounts remain readable by design. The runtime set is not a
+complete host-file secrecy boundary.
 
 The path checks are `std`-only and are not race-free against another local
-process changing the filesystem at the same time. Hard-link aliases and
-future filesystem or kernel bugs are outside this release's guarantee.
+process changing the filesystem at the same time. Existing symlink and
+special-file entries in writable trees are rejected, and `Cargo.lock` must not
+be a hard-link alias. Hard-link aliases inside Cargo's target tree and
+concurrent filesystem changes remain known limitations. Future filesystem or
+kernel bugs are outside this release's guarantee.
 
 Artifacts written to `target` are not trusted automatically, and the tool does
 not make their later execution safe. There is no seccomp profile, GUI,

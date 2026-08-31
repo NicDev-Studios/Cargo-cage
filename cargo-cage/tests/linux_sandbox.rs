@@ -5,18 +5,26 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 #[test]
 fn linux_sandbox_acceptance_matrix() {
     simple_build_works();
+    proc_macro_build_works();
     supported_cargo_commands_work();
     out_dir_is_writable();
     doctor_is_non_mutating();
     sensitive_home_path_is_hidden();
+    host_home_socket_is_hidden();
     sensitive_environment_is_removed();
     cargo_config_is_hidden();
+    runtime_paths_are_hidden();
+    inherited_file_descriptors_are_closed();
+    parent_death_kills_nested_builds();
     workspace_write_is_denied();
     nested_child_inherits_policy();
     network_is_denied();
@@ -37,6 +45,13 @@ fn simple_build_works() {
     let output = run_cage(&fixture, &[]);
     assert_success(&output);
     assert!(fixture.file("target/debug/cage-simple-build").is_file());
+}
+
+fn proc_macro_build_works() {
+    let fixture = materialize("proc-macro-build").expect("proc-macro fixture");
+    let output = run_cage(&fixture, &[]);
+    assert_success(&output);
+    assert!(fixture.file("target/debug/cage-proc-macro-build").is_file());
 }
 
 fn supported_cargo_commands_work() {
@@ -74,64 +89,140 @@ fn doctor_is_non_mutating() {
 
 fn sensitive_home_path_is_hidden() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
-    let fake_home = fixture.file("fake-home");
+    let fake_home = test_home(&fixture);
     fs::create_dir_all(fake_home.join(".ssh")).expect("fake ssh directory");
     fs::write(fake_home.join(".ssh/fixture-secret"), b"must stay hidden").expect("fake ssh secret");
+    fs::write(
+        fake_home.join("unlisted-fixture-secret"),
+        b"must also stay hidden",
+    )
+    .expect("unlisted fake home secret");
 
-    let output = run_cage_with_env(&fixture, &[("CAGE_TEST_ACTION", "home-read")]);
+    let output = run_cage_feature(&fixture, "home-read", &[]);
     assert_policy_failure(&output);
     assert!(fake_home.join(".ssh/fixture-secret").is_file());
 }
 
+fn host_home_socket_is_hidden() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let fake_home = test_home(&fixture);
+    let socket = fake_home.join("fixture-agent.sock");
+    let _listener = UnixListener::bind(&socket).expect("fake host agent socket");
+
+    let output = run_cage_feature(&fixture, "home-socket-read", &[]);
+    assert_policy_failure(&output);
+    assert!(socket.exists());
+}
+
 fn sensitive_environment_is_removed() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
-    let mut command = base_command(&fixture);
-    command
-        .env("CAGE_TEST_ACTION", "secret-env")
-        .env("AWS_SECRET_ACCESS_KEY", "fixture-secret")
-        .env("GITHUB_TOKEN", "fixture-token")
-        .env("CAGE_TEST_TOKEN", "fixture-token")
-        .env("CAGE_TEST_PASSWORD", "fixture-password")
-        .env("SSH_AUTH_SOCK", "/tmp/fixture-agent.sock");
-    let output = command.output().expect("run cargo-cage");
+    let output = run_cage_feature(
+        &fixture,
+        "secret-env",
+        &[
+            ("AWS_SECRET_ACCESS_KEY", "fixture-secret"),
+            ("GITHUB_TOKEN", "fixture-token"),
+            ("CAGE_TEST_ARBITRARY_SECRET", "fixture-arbitrary-secret"),
+            ("CARGO_REGISTRIES_CRATES_IO_TOKEN", "fixture-crates-token"),
+            ("SSH_AUTH_SOCK", "/tmp/fixture-agent.sock"),
+        ],
+    );
     assert_policy_failure(&output);
     let text = output_text(&output);
     assert!(!text.contains("fixture-secret"), "{text}");
     assert!(!text.contains("fixture-token"), "{text}");
+    assert!(!text.contains("fixture-crates-token"), "{text}");
     assert!(!text.contains("fixture-password"), "{text}");
 }
 
 fn cargo_config_is_hidden() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let cargo_home = test_cargo_home(&fixture);
-    fs::write(
-        cargo_home.join("config.toml"),
-        b"[registries.private]\ntoken = \"fixture-secret\"\n",
-    )
-    .expect("write Cargo config fixture");
+    let config = cargo_home.join("config.toml");
+    let config_before = b"[registries.private]\ntoken = \"fixture-secret\"\n";
+    fs::write(&config, config_before).expect("write Cargo config fixture");
 
-    let output = run_cage_with_cargo_home(
-        &fixture,
-        &cargo_home,
-        &[("CAGE_TEST_ACTION", "cargo-config-read")],
-    );
+    let output = run_cage_feature_with_cargo_home(&fixture, "cargo-config-read", &cargo_home, &[]);
     assert_policy_failure(&output);
     let text = output_text(&output);
     assert!(text.contains("Cargo configuration"), "{text}");
     assert!(!text.contains("fixture-secret"), "{text}");
+    assert_eq!(
+        fs::read(config).expect("read Cargo config after build"),
+        config_before
+    );
+}
+
+fn runtime_paths_are_hidden() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let output = run_cage_feature(&fixture, "runtime-path-read", &[]);
+    assert_policy_failure(&output);
+}
+
+fn inherited_file_descriptors_are_closed() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let secret = fixture.file("inherited-fd-secret");
+    let secret_before = b"must not be readable through fd 3";
+    fs::write(&secret, secret_before).expect("write inherited fd fixture");
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_cargo-cage"));
+    let manifest = fixture.file("Cargo.toml");
+    let mut command = Command::new("sh");
+    command
+        .current_dir(fixture.path())
+        .args([
+            "-c",
+            "exec 3<\"$1\"; shift; exec \"$@\"",
+            "cargo-cage-fd-test",
+        ])
+        .arg(&secret)
+        .arg(binary)
+        .args(["build", "--manifest-path"])
+        .arg(manifest)
+        .args(["--features", "fd-read"])
+        .env("HOME", test_home(&fixture))
+        .env("CARGO_HOME", test_cargo_home(&fixture))
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    apply_rustup_home(&mut command);
+
+    let output = command.output().expect("run cargo-cage with inherited fd");
+    assert_policy_failure(&output);
+    assert_eq!(
+        fs::read(&secret).expect("read inherited fd fixture"),
+        secret_before
+    );
+}
+
+fn parent_death_kills_nested_builds() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let started = fixture.file("target/parent-death-started");
+    let finished = fixture.file("target/parent-death-finished");
+    let mut command = base_command_for(&fixture, "build");
+    command.args(["--features", "parent-death"]);
+    let mut child = command.spawn().expect("spawn cargo-cage parent-death test");
+
+    for _ in 0..50 {
+        if started.is_file() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(started.is_file(), "parent-death fixture did not start");
+
+    child.kill().expect("kill cargo-cage parent");
+    let _ = child.wait().expect("wait for killed cargo-cage");
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        !finished.exists(),
+        "nested child survived cargo-cage parent"
+    );
 }
 
 fn workspace_write_is_denied() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let path = fixture.file("build-script-write.txt");
-    let path_value = path.to_str().expect("UTF-8 test path");
-    let output = run_cage_with_env(
-        &fixture,
-        &[
-            ("CAGE_TEST_ACTION", "workspace-write"),
-            ("CAGE_TEST_WRITE_PATH", path_value),
-        ],
-    );
+    let output = run_cage_feature(&fixture, "workspace-write", &[]);
     assert_policy_failure(&output);
     assert!(!path.exists());
 }
@@ -139,14 +230,7 @@ fn workspace_write_is_denied() {
 fn nested_child_inherits_policy() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let path = fixture.file("nested-write.txt");
-    let path_value = path.to_str().expect("UTF-8 test path");
-    let output = run_cage_with_env(
-        &fixture,
-        &[
-            ("CAGE_TEST_ACTION", "nested-write"),
-            ("CAGE_TEST_WRITE_PATH", path_value),
-        ],
-    );
+    let output = run_cage_feature(&fixture, "nested-write", &[]);
     assert_policy_failure(&output);
     assert!(!path.exists());
 }
@@ -155,13 +239,8 @@ fn network_is_denied() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local listener");
     let endpoint = listener.local_addr().expect("listener address").to_string();
-    let output = run_cage_with_env(
-        &fixture,
-        &[
-            ("CAGE_TEST_ACTION", "network"),
-            ("CAGE_TEST_ENDPOINT", endpoint.as_str()),
-        ],
-    );
+    fs::write(fixture.file("network-endpoint.txt"), endpoint).expect("write network endpoint");
+    let output = run_cage_feature(&fixture, "network", &[]);
     assert_policy_failure(&output);
 }
 
@@ -172,16 +251,8 @@ fn symlink_escape_is_denied() {
     fs::create_dir(fixture.file("target")).expect("target directory");
     let external = fixture.file("symlink-target.txt");
     symlink(&external, fixture.file("target/escape-link")).expect("escape symlink");
-    let link_path = fixture.file("target/escape-link");
-    let link_value = link_path.to_str().expect("UTF-8 test path");
-    let output = run_cage_with_env(
-        &fixture,
-        &[
-            ("CAGE_TEST_ACTION", "symlink-escape"),
-            ("CAGE_TEST_SYMLINK", link_value),
-        ],
-    );
-    assert_policy_failure(&output);
+    let output = run_cage_feature(&fixture, "symlink-escape", &[]);
+    assert_setup_policy_failure(&output, "symlink");
     assert!(!external.exists());
 }
 
@@ -316,7 +387,7 @@ fn defective_backend_fails_closed() {
     let fake_bwrap = fixture.file("fake-bwrap");
     fs::write(
         &fake_bwrap,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'bubblewrap 0.8.0\\n'\n  exit 0\nfi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'bubblewrap 0.12.0\\n'\n  exit 0\nfi\nexit 0\n",
     )
     .expect("write fake Bubblewrap");
     let mut permissions = fs::metadata(&fake_bwrap)
@@ -344,7 +415,7 @@ fn old_backend_fails_closed() {
     let old_bwrap = fixture.file("old-bwrap");
     fs::write(
         &old_bwrap,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'bubblewrap 0.7.0\\n'\n  exit 0\nfi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'bubblewrap 0.11.2\\n'\n  exit 0\nfi\nexit 0\n",
     )
     .expect("write old Bubblewrap");
     let mut permissions = fs::metadata(&old_bwrap)
@@ -358,27 +429,29 @@ fn old_backend_fails_closed() {
     let output = command.output().expect("run cargo-cage");
     assert!(!output.status.success());
     let text = output_text(&output);
-    assert!(text.contains("too old") && text.contains("0.8"), "{text}");
+    assert!(
+        text.contains("too old") && text.contains("0.12.0"),
+        "{text}"
+    );
     assert!(!fixture.file("target").exists());
 }
 
 fn run_cage(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
-    run_cage_with_env(fixture, extra)
+    let mut command = base_command_for(fixture, "build");
+    apply_extra_environment(&mut command, extra);
+    command.output().expect("run cargo-cage")
 }
 
-fn run_cage_with_env(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
+fn run_cage_feature(fixture: &Fixture, feature: &str, extra: &[(&str, &str)]) -> Output {
     let mut command = base_command_for(fixture, "build");
-    for (key, value) in extra {
-        command.env(key, value);
-    }
+    command.args(["--features", feature]);
+    apply_extra_environment(&mut command, extra);
     command.output().expect("run cargo-cage")
 }
 
 fn run_cage_command(fixture: &Fixture, cargo_command: &str, extra: &[(&str, &str)]) -> Output {
     let mut command = base_command_for(fixture, cargo_command);
-    for (key, value) in extra {
-        command.env(key, value);
-    }
+    apply_extra_environment(&mut command, extra);
     command.output().expect("run cargo-cage")
 }
 
@@ -388,7 +461,7 @@ fn run_doctor(fixture: &Fixture, verbose: bool) -> Output {
     command
         .current_dir(fixture.path())
         .arg("doctor")
-        .env("HOME", fixture.file("fake-home"))
+        .env("HOME", test_home(fixture))
         .env("CARGO_HOME", cargo_home)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR");
@@ -412,6 +485,20 @@ fn run_cage_with_cargo_home(
     command.output().expect("run cargo-cage")
 }
 
+fn run_cage_feature_with_cargo_home(
+    fixture: &Fixture,
+    feature: &str,
+    cargo_home: &Path,
+    extra: &[(&str, &str)],
+) -> Output {
+    let mut command = base_command(fixture);
+    command
+        .args(["--features", feature])
+        .env("CARGO_HOME", cargo_home);
+    apply_extra_environment(&mut command, extra);
+    command.output().expect("run cargo-cage")
+}
+
 fn base_command_for(fixture: &Fixture, cargo_command: &str) -> Command {
     let cargo_home = test_cargo_home(fixture);
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cage"));
@@ -419,7 +506,7 @@ fn base_command_for(fixture: &Fixture, cargo_command: &str) -> Command {
         .current_dir(fixture.path())
         .args([cargo_command, "--manifest-path"])
         .arg(fixture.file("Cargo.toml"))
-        .env("HOME", fixture.file("fake-home"))
+        .env("HOME", test_home(fixture))
         .env("CARGO_HOME", cargo_home)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR");
@@ -436,9 +523,15 @@ fn cargo_program() -> OsString {
 }
 
 fn test_cargo_home(fixture: &Fixture) -> PathBuf {
-    let path = fixture.file("cargo-home");
-    fs::create_dir_all(&path).expect("create fixture Cargo home");
-    path
+    fixture
+        .temporary_dir("cargo-home")
+        .expect("create fixture Cargo home")
+}
+
+fn test_home(fixture: &Fixture) -> PathBuf {
+    fixture
+        .temporary_dir("fake-home")
+        .expect("create fixture home")
 }
 
 fn apply_rustup_home(command: &mut Command) {
@@ -453,6 +546,12 @@ fn prepend_path(directory: &Path) -> OsString {
         entries.extend(env::split_paths(&path));
     }
     env::join_paths(entries).expect("valid PATH")
+}
+
+fn apply_extra_environment(command: &mut Command, extra: &[(&str, &str)]) {
+    for (key, value) in extra {
+        command.env(key, value);
+    }
 }
 
 fn assert_success(output: &Output) {
@@ -471,6 +570,18 @@ fn assert_policy_failure(output: &Output) {
         text.contains("cargo-cage: Cargo build failed inside the Linux sandbox"),
         "{text}"
     );
+}
+
+fn assert_setup_policy_failure(output: &Output, rule_fragment: &str) {
+    assert!(
+        !output.status.success(),
+        "unexpected success: {}",
+        output_text(output)
+    );
+    let text = output_text(output);
+    assert!(text.contains(rule_fragment), "{text}");
+    assert!(text.contains("sandbox policy error"), "{text}");
+    assert!(text.contains("remedy:"), "{text}");
 }
 
 fn assert_cache_setup_failure(output: &Output) {

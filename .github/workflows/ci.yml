@@ -29,9 +29,12 @@ jobs:
             test "$(< /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 0
           fi
       - name: Install sandbox runtime
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        run: bash .github/scripts/install-bubblewrap.sh
       - name: Check sandbox runtime
-        run: bwrap --version
+        run: |
+          bwrap --version
+          dpkg --compare-versions "$(bwrap --version | awk 'NR == 1 { print $2 }')" ge "0.12.0"
+          [[ "$(stat --format='%A' /usr/bin/bwrap)" != *s* ]]
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
