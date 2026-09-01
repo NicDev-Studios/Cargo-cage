@@ -12,37 +12,94 @@ use std::time::Duration;
 
 #[test]
 fn linux_sandbox_acceptance_matrix() {
-    simple_build_works();
-    proc_macro_build_works();
-    supported_cargo_commands_work();
-    out_dir_is_writable();
-    doctor_is_non_mutating();
-    sensitive_home_path_is_hidden();
-    host_home_socket_is_hidden();
-    sensitive_environment_is_removed();
-    cargo_config_is_hidden();
-    runtime_paths_are_hidden();
-    project_toolchain_path_is_rejected_before_compiler_execution();
-    inherited_file_descriptors_do_not_reach_the_build();
-    parent_death_kills_nested_builds();
-    workspace_write_is_denied();
-    nested_child_inherits_policy();
-    network_is_denied();
-    workspace_special_file_is_rejected();
-    workspace_external_symlink_is_rejected();
-    workspace_external_hardlink_is_rejected();
-    target_external_hardlink_is_rejected();
-    incremental_build_hardlinks_are_allowed();
-    symlink_escape_is_denied();
-    symlink_target_is_rejected();
-    cargo_cache_symlink_is_rejected();
-    cargo_git_cache_symlink_is_rejected();
-    cargo_cache_nested_symlink_is_rejected();
-    cargo_cache_special_file_is_rejected();
-    cargo_cache_external_hardlink_is_rejected();
-    missing_backend_fails_closed();
-    old_backend_fails_closed();
-    defective_backend_fails_closed();
+    run_case("simple_build_works", simple_build_works);
+    run_case("proc_macro_build_works", proc_macro_build_works);
+    run_case(
+        "supported_cargo_commands_work",
+        supported_cargo_commands_work,
+    );
+    run_case("out_dir_is_writable", out_dir_is_writable);
+    run_case("doctor_is_non_mutating", doctor_is_non_mutating);
+    run_case(
+        "sensitive_home_path_is_hidden",
+        sensitive_home_path_is_hidden,
+    );
+    run_case("host_home_socket_is_hidden", host_home_socket_is_hidden);
+    run_case(
+        "sensitive_environment_is_removed",
+        sensitive_environment_is_removed,
+    );
+    run_case("cargo_config_is_hidden", cargo_config_is_hidden);
+    run_case("runtime_paths_are_hidden", runtime_paths_are_hidden);
+    run_case(
+        "project_toolchain_path_is_rejected_before_compiler_execution",
+        project_toolchain_path_is_rejected_before_compiler_execution,
+    );
+    run_case(
+        "inherited_file_descriptors_do_not_reach_the_build",
+        inherited_file_descriptors_do_not_reach_the_build,
+    );
+    run_case(
+        "parent_death_kills_nested_builds",
+        parent_death_kills_nested_builds,
+    );
+    run_case("workspace_write_is_denied", workspace_write_is_denied);
+    run_case("nested_child_inherits_policy", nested_child_inherits_policy);
+    run_case("network_is_denied", network_is_denied);
+    run_case(
+        "workspace_special_file_is_rejected",
+        workspace_special_file_is_rejected,
+    );
+    run_case(
+        "workspace_external_symlink_is_rejected",
+        workspace_external_symlink_is_rejected,
+    );
+    run_case(
+        "workspace_external_hardlink_is_rejected",
+        workspace_external_hardlink_is_rejected,
+    );
+    run_case(
+        "target_external_hardlink_is_rejected",
+        target_external_hardlink_is_rejected,
+    );
+    run_case(
+        "incremental_build_hardlinks_are_allowed",
+        incremental_build_hardlinks_are_allowed,
+    );
+    run_case("symlink_escape_is_denied", symlink_escape_is_denied);
+    run_case("symlink_target_is_rejected", symlink_target_is_rejected);
+    run_case(
+        "cargo_cache_symlink_is_rejected",
+        cargo_cache_symlink_is_rejected,
+    );
+    run_case(
+        "cargo_git_cache_symlink_is_rejected",
+        cargo_git_cache_symlink_is_rejected,
+    );
+    run_case(
+        "cargo_cache_nested_symlink_is_rejected",
+        cargo_cache_nested_symlink_is_rejected,
+    );
+    run_case(
+        "cargo_cache_special_file_is_rejected",
+        cargo_cache_special_file_is_rejected,
+    );
+    run_case(
+        "cargo_cache_external_hardlink_is_rejected",
+        cargo_cache_external_hardlink_is_rejected,
+    );
+    run_case("missing_backend_fails_closed", missing_backend_fails_closed);
+    run_case("old_backend_fails_closed", old_backend_fails_closed);
+    run_case(
+        "defective_backend_fails_closed",
+        defective_backend_fails_closed,
+    );
+}
+
+fn run_case(name: &str, case: fn()) {
+    eprintln!("cargo-cage integration: {name} ...");
+    case();
+    eprintln!("cargo-cage integration: {name}: ok");
 }
 
 fn simple_build_works() {
