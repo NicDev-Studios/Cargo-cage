@@ -109,3 +109,36 @@ jobs:
           cd "$smoke_dir/smoke-project"
           cargo-cage --help >/dev/null
           cargo-cage build
+
+  github-draft:
+    name: Create GitHub draft release
+    needs: verify-install
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create draft pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          title="cargo-cage $tag"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --prerelease \
+              --title "$title"
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --title "$title" \
+              --generate-notes
+          fi
