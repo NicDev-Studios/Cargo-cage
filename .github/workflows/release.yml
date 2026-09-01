@@ -126,19 +126,26 @@ jobs:
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
           title="cargo-cage $tag"
+          if [[ "$tag" == *-* ]]; then
+            prerelease_flag=(--prerelease)
+          else
+            prerelease_flag=(--prerelease=false)
+          fi
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
-              --prerelease \
+              "${prerelease_flag[@]}" \
               --title "$title"
           else
-            gh release create "$tag" \
+            create_args=(
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
-              --prerelease \
               --title "$title" \
               --generate-notes
+              "${prerelease_flag[@]}"
+            )
+            gh release create "$tag" "${create_args[@]}"
           fi
