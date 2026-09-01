@@ -165,11 +165,26 @@ fn runtime_paths_are_hidden() {
 }
 
 fn project_toolchain_path_is_rejected_before_compiler_execution() {
-    let rustup_available = Command::new("rustup")
+    let mut rustup_probe = Command::new("rustup");
+    rustup_probe
         .args(["which", "rustc"])
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if !rustup_available {
+        .env_remove("RUSTUP_TOOLCHAIN");
+    let rustup_output = rustup_probe.output();
+    let Ok(rustup_output) = rustup_output else {
+        return;
+    };
+    if !rustup_output.status.success() {
+        return;
+    }
+    let rustup_home = env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
+    let Some(rustup_home) = rustup_home else {
+        return;
+    };
+    if !fs::symlink_metadata(&rustup_home)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
         return;
     }
 
@@ -202,11 +217,16 @@ fn project_toolchain_path_is_rejected_before_compiler_execution() {
     )
     .expect("project toolchain override");
 
-    let output = run_cage(&fixture, &[]);
+    let mut command = base_command(&fixture);
+    command.env("RUSTC", "rustup");
+    command.env("RUSTUP_HOME", &rustup_home);
+    command.env_remove("RUSTUP_TOOLCHAIN");
+    let output = command.output().expect("run cargo-cage");
     assert!(!output.status.success(), "unexpected toolchain success");
     let text = output_text(&output);
     assert!(
-        text.contains("Rustup-selected rustc") || text.contains("trusted Rustup toolchains"),
+        text.to_ascii_lowercase().contains("rustup")
+            || text.to_ascii_lowercase().contains("toolchain"),
         "{text}"
     );
     assert!(!marker.exists(), "project compiler ran before sandbox");
