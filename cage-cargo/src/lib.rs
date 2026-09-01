@@ -407,6 +407,9 @@ fn locate_workspace(
         policy.read_only_paths.push(manifest_parent);
     }
     policy
+        .writable_paths
+        .extend(discovery_writable_paths(cargo_args, current_dir)?);
+    policy
         .read_only_paths
         .extend(toolchain.read_only_paths.iter().cloned());
     locate_request.policy = policy;
@@ -423,6 +426,34 @@ fn locate_workspace(
     }
 
     workspace_from_output(&locate_outcome.stdout, current_dir)
+}
+
+fn discovery_writable_paths(
+    cargo_args: &[OsString],
+    current_dir: &Path,
+) -> CageResult<Vec<PathBuf>> {
+    let bases = if let Some(parent) = manifest_parent_path(cargo_args, current_dir)? {
+        vec![parent]
+    } else {
+        vec![current_dir.to_path_buf()]
+    };
+
+    let mut candidates = bases
+        .iter()
+        .map(|base| base.join("target"))
+        .collect::<Vec<_>>();
+    if let Ok(target) = paths::target_dir_arg(cargo_args, current_dir, current_dir) {
+        if bases
+            .iter()
+            .any(|base| target == *base || target.starts_with(base))
+        {
+            candidates.push(target);
+        }
+    }
+
+    candidates.retain(|path| fs::symlink_metadata(path).is_ok());
+    candidates.dedup();
+    Ok(candidates)
 }
 
 fn cargo_environment(
@@ -1334,6 +1365,26 @@ mod tests {
         .expect("rewrite safe relative paths");
         assert_eq!(rewritten[1], workspace.join("Cargo.toml").into_os_string());
         assert_eq!(rewritten[3], target.into_os_string());
+    }
+
+    #[test]
+    fn discovery_writable_paths_follow_explicit_manifest_root() {
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let target = workspace.join("target");
+        fs::create_dir(&target).expect("create test target");
+        let current_dir = workspace.parent().expect("workspace parent");
+
+        let writable = discovery_writable_paths(
+            &[
+                OsString::from("--manifest-path"),
+                workspace.join("Cargo.toml").into_os_string(),
+            ],
+            current_dir,
+        )
+        .expect("discovery writable paths");
+
+        assert_eq!(writable, vec![target]);
     }
 
     #[test]
