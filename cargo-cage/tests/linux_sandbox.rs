@@ -292,7 +292,7 @@ fn project_toolchain_path_is_rejected_before_compiler_execution() {
 fn inherited_file_descriptors_do_not_reach_the_build() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
     let secret = fixture.file("inherited-fd-secret");
-    let secret_before = b"must not be readable through fd 3";
+    let secret_before = b"must not be readable through fd 9";
     fs::write(&secret, secret_before).expect("write inherited fd fixture");
 
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_cargo-cage"));
@@ -302,7 +302,7 @@ fn inherited_file_descriptors_do_not_reach_the_build() {
         .current_dir(fixture.path())
         .args([
             "-c",
-            "exec 3<\"$1\"; shift; exec \"$@\"",
+            "exec 9<\"$1\"; shift; exec \"$@\"",
             "cargo-cage-fd-test",
         ])
         .arg(&secret)

@@ -179,15 +179,16 @@ fn runtime_path_read() -> ! {
 }
 
 fn inherited_fd_read() -> ! {
-    match fs::read_to_string("/proc/self/fd/3") {
-        Ok(contents) => panic!(
-            "CAGE_POLICY_BYPASSED: inherited file descriptor 3 was readable ({} bytes)",
-            contents.len()
-        ),
-        Err(error) => {
-            panic!("CAGE_POLICY_DENIED: inherited file descriptor 3 was unavailable: {error}")
-        }
+    let descriptor = "/proc/self/fd/9";
+    let secret = manifest_path("inherited-fd-secret");
+    if fs::canonicalize(descriptor).is_ok_and(|path| path == secret) {
+        panic!(
+            "CAGE_POLICY_BYPASSED: inherited file descriptor 9 still pointed at the fixture secret"
+        );
     }
+    panic!(
+        "CAGE_POLICY_DENIED: inherited file descriptor 9 did not expose the fixture secret"
+    );
 }
 
 fn parent_death_probe() {
