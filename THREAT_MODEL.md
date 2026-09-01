@@ -8,9 +8,8 @@ Those processes are useful, but a dependency can also use them to read files,
 open sockets, or modify the checkout. `cargo-cage` tries to make that failure
 mode less painful on Linux.
 
-It is an experimental, local-build boundary. It is not a proof of complete
-isolation, and the current hardening work remains version `0.3.0` until Ubuntu
-CI has passed.
+It is an experimental, local-build boundary. This first public alpha is
+`0.1.0-alpha.1`; it is not a proof of complete isolation.
 
 ## Adversary
 
@@ -63,7 +62,8 @@ caches are mounted read-only only after checking their roots and contents.
 Cargo user config and credential files stay out of the sandbox. A project-local
 Cargo config remains visible because it is project input, not host trust.
 Standard stdio remains connected; extra inherited file descriptors are scrubbed
-before the build process is exec'd.
+before the build process is exec'd by the fixed `/bin/bash` scrubber. A missing
+Bash runtime is a setup error, not a fallback condition.
 
 Workspace, cache, target, lockfile, hidden, and toolchain paths are checked
 before mounting. Traversal, unsafe symlink resolution, special files, nested

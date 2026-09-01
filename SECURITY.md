@@ -1,6 +1,6 @@
 # Security
 
-Let's be direct: `cargo-cage` is experimental. It adds a useful Linux
+Let's be direct: `cargo-cage 0.1.0-alpha.1` is experimental. It adds a useful Linux
 boundary around Cargo, but it is not a complete sandbox and it does not come
 with a promise that hostile code can never escape. If you need a hard,
 independent trust boundary, use a VM or a dedicated build service as well.
@@ -34,7 +34,8 @@ Cargo/Rust, compiler, locale, and terminal values needed for normal builds.
 Credentials, agent variables, `CARGO_HOME`, `RUSTUP_HOME`, and arbitrary host
 variables do not cross the boundary. Policy removals win over later
 environment values. Standard stdio is kept for normal Cargo behaviour; extra
-inherited file descriptors are closed before the build process starts.
+inherited file descriptors are closed before the build process starts by a
+small fixed `/bin/bash` scrubber. If Bash is missing, setup fails closed.
 
 Cargo gets a private `CARGO_HOME`. Only existing `registry` and `git` caches
 are considered, and only after their roots and contents pass validation.

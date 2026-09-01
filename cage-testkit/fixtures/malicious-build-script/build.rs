@@ -33,6 +33,9 @@ fn main() {
     if env::var_os("CARGO_FEATURE_SYMLINK_ESCAPE").is_some() {
         symlink_escape();
     }
+    if env::var_os("CARGO_FEATURE_RUNTIME_HARDLINK_ESCAPE").is_some() {
+        runtime_hardlink_escape();
+    }
     if env::var_os("CARGO_FEATURE_RUNTIME_PATH_READ").is_some() {
         runtime_path_read();
     }
@@ -165,6 +168,28 @@ fn symlink_escape() -> ! {
         Err(error) => panic!(
             "CAGE_POLICY_DENIED: could not write through {}: {error}",
             path.display()
+        ),
+    }
+}
+
+fn runtime_hardlink_escape() -> ! {
+    let source = manifest_path("Cargo.toml");
+    let alias = manifest_path("target/runtime-hardlink-escape");
+    match fs::hard_link(&source, &alias) {
+        Ok(()) => match fs::write(&alias, b"runtime hardlink escape") {
+            Ok(()) => panic!(
+                "CAGE_POLICY_BYPASSED: wrote through runtime hardlink {} to {}",
+                alias.display(),
+                source.display()
+            ),
+            Err(error) => panic!(
+                "CAGE_POLICY_DENIED: runtime hardlink write to {} failed: {error}",
+                alias.display()
+            ),
+        },
+        Err(error) => panic!(
+            "CAGE_POLICY_DENIED: could not create runtime hardlink {}: {error}",
+            alias.display()
         ),
     }
 }

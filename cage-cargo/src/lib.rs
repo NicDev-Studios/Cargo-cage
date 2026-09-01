@@ -425,7 +425,7 @@ fn locate_workspace(
         });
     }
 
-    workspace_from_output(&locate_outcome.stdout, current_dir)
+    workspace_from_output(&locate_outcome.stdout, current_dir, cargo_args)
 }
 
 fn discovery_writable_paths(
@@ -1089,7 +1089,11 @@ fn validate_executable_path(path: PathBuf) -> CageResult<PathBuf> {
     }
 }
 
-fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBuf> {
+fn workspace_from_output(
+    output: &[u8],
+    current_dir: &Path,
+    cargo_args: &[OsString],
+) -> CageResult<PathBuf> {
     let output = String::from_utf8_lossy(output);
     let manifest = output.trim();
     if manifest.is_empty() || manifest.contains('\n') || manifest.contains('\r') {
@@ -1120,13 +1124,29 @@ fn workspace_from_output(output: &[u8], current_dir: &Path) -> CageResult<PathBu
             "run cargo-cage from a Cargo workspace or pass a valid --manifest-path",
         ));
     }
-    manifest.parent().map(Path::to_path_buf).ok_or_else(|| {
+    let workspace = manifest.parent().map(Path::to_path_buf).ok_or_else(|| {
         CageError::policy(
             manifest.display().to_string(),
             "the workspace manifest must have a parent directory",
             "use a valid Cargo workspace manifest path",
         )
-    })
+    })?;
+    if let Some(requested_manifest) = resolved_manifest_path(cargo_args, current_dir)? {
+        if !requested_manifest.starts_with(&workspace) {
+            return Err(CageError::policy(
+                workspace.display().to_string(),
+                "workspace discovery returned a root that does not contain the requested manifest",
+                "use a Cargo workspace or pass a manifest path inside the discovered workspace",
+            ));
+        }
+    } else if current_dir != workspace && !current_dir.starts_with(&workspace) {
+        return Err(CageError::policy(
+            workspace.display().to_string(),
+            "workspace discovery returned a root that does not contain the current directory",
+            "run cargo-cage from the intended workspace or pass an explicit manifest path",
+        ));
+    }
+    Ok(workspace)
 }
 
 fn canonical_existing_path_without_symlinks(path: &Path, label: &str) -> CageResult<PathBuf> {
@@ -1207,6 +1227,7 @@ mod tests {
 
     struct RecordingBackend {
         workspace: PathBuf,
+        discovery_workspace: Option<PathBuf>,
         second_status: ProcessStatus,
         calls: RefCell<Vec<SandboxRequest>>,
     }
@@ -1216,9 +1237,10 @@ mod tests {
             let call_number = self.calls.borrow().len();
             self.calls.borrow_mut().push(request.clone());
             if call_number == 0 {
+                let workspace = self.discovery_workspace.as_ref().unwrap_or(&self.workspace);
                 Ok(SandboxOutcome {
                     status: ProcessStatus::success(),
-                    stdout: format!("{}\n", self.workspace.join("Cargo.toml").display()).into(),
+                    stdout: format!("{}\n", workspace.join("Cargo.toml").display()).into(),
                     stderr: Vec::new(),
                 })
             } else {
@@ -1265,6 +1287,7 @@ mod tests {
         let target = workspace.join("target");
         let backend = RecordingBackend {
             workspace: workspace.clone(),
+            discovery_workspace: None,
             second_status: ProcessStatus { code: Some(23) },
             calls: RefCell::new(Vec::new()),
         };
@@ -1308,6 +1331,7 @@ mod tests {
             let target = workspace.join("target");
             let backend = RecordingBackend {
                 workspace: workspace.clone(),
+                discovery_workspace: None,
                 second_status: ProcessStatus { code: Some(23) },
                 calls: RefCell::new(Vec::new()),
             };
@@ -1388,11 +1412,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unrelated_workspace_discovery_output() {
+        let requested = TestWorkspace::new();
+        let requested = fs::canonicalize(&requested.0).expect("requested workspace");
+        let returned = TestWorkspace::new();
+        let returned = fs::canonicalize(&returned.0).expect("returned workspace");
+        let error = workspace_from_output(
+            format!("{}\n", returned.join("Cargo.toml").display()).as_bytes(),
+            &requested,
+            &[
+                OsString::from("--manifest-path"),
+                requested.join("Cargo.toml").into_os_string(),
+            ],
+        )
+        .expect_err("unrelated discovered workspace");
+        let text = error.to_string();
+        assert!(
+            text.contains("does not contain the requested manifest"),
+            "{text}"
+        );
+        assert!(text.contains("remedy:"), "{text}");
+    }
+
+    #[test]
     fn doctor_returns_success_when_the_sandbox_probe_succeeds() {
         let workspace = TestWorkspace::new();
         let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
         let backend = RecordingBackend {
             workspace: workspace.clone(),
+            discovery_workspace: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
             second_status: ProcessStatus::success(),
             calls: RefCell::new(Vec::new()),
         };
@@ -1411,6 +1459,7 @@ mod tests {
         let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
         let backend = RecordingBackend {
             workspace: workspace.clone(),
+            discovery_workspace: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
             second_status: ProcessStatus { code: Some(23) },
             calls: RefCell::new(Vec::new()),
         };

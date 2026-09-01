@@ -96,7 +96,7 @@ pub fn is_help_request(args: &[OsString]) -> bool {
 }
 
 pub fn help_text() -> &'static str {
-    "cargo-cage v0.3.0\n\nUSAGE:\n    cargo-cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo-cage doctor [--verbose]\n\nCargo runs in an experimental Linux sandbox. Network access is denied,\nHOME is private, the child environment uses a fixed allowlist, and persistent\nwrites are limited to target and Cargo.lock. Dependencies must be available\nlocally; use `cargo fetch` separately before running an offline command.\n\nThe direct `cargo-cage` executable is required for the security boundary.\nThe `cargo cage` dispatcher form is intentionally unsupported because Cargo\nconfiguration aliases can bypass external subcommands.\n\n`doctor` checks Bubblewrap, namespaces, workspace paths, toolchain paths, and\nCargo caches without modifying the project.\n"
+    "cargo-cage v0.1.0-alpha.1\n\nUSAGE:\n    cargo-cage <build|check|test|doc> [CARGO_OPTIONS...]\n    cargo-cage doctor [--verbose]\n\nCargo runs in an experimental Linux sandbox. Network access is denied,\nHOME is private, the child environment uses a fixed allowlist, and persistent\nwrites are limited to target and Cargo.lock. Dependencies must be available\nlocally; use `cargo fetch` separately before running an offline command.\n\nThe direct `cargo-cage` executable is required for the security boundary.\nThe `cargo cage` dispatcher form is intentionally unsupported because Cargo\nconfiguration aliases can bypass external subcommands.\n\n`doctor` checks Bubblewrap, namespaces, workspace paths, toolchain paths, and\nCargo caches without modifying the project.\n"
 }
 
 #[cfg(test)]

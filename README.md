@@ -46,15 +46,17 @@ dedicated build service, or a careful review of the code you build.
 The same policy is used for `build`, `check`, `test`, and `doc`. `doctor`
 checks the setup without creating or changing project files.
 
-The next hardening work is still kept at version `0.3.0` until the required
-Ubuntu CI run is green. There is no v0.4 release to install yet.
+This is the first public alpha, `0.1.0-alpha.1`. It is deliberately rough
+around the edges and should not be mistaken for a production-grade sandbox.
 
 ## Requirements and installation
 
 The reference setup is Ubuntu 24.04 x86_64 with unprivileged user namespaces
 enabled, a host security policy that permits Bubblewrap, and Bubblewrap
 `0.12.0` or newer. Other Linux distributions may work; they are not the
-reference platform. macOS and Windows are not supported.
+reference platform. macOS and Windows are not supported. The Linux runtime
+also needs Bash at `/bin/bash`; cargo-cage uses it only for the small
+file-descriptor scrubber and stops if it is missing.
 
 ```sh
 sudo apt-get install bubblewrap
@@ -65,6 +67,12 @@ cargo install --path cargo-cage --locked
 If your distribution ships an older Bubblewrap, install its security update or
 a checksum-verified newer build. `cargo-cage` stops instead of running Cargo
 unsandboxed.
+
+Once the alpha is published, install it from crates.io with:
+
+```sh
+cargo install cargo-cage --locked --version 0.1.0-alpha.1
+```
 
 The public crates are named consistently on crates.io:
 

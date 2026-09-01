@@ -8,7 +8,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn linux_sandbox_acceptance_matrix() {
@@ -67,6 +67,10 @@ fn linux_sandbox_acceptance_matrix() {
         incremental_build_hardlinks_are_allowed,
     );
     run_case("symlink_escape_is_denied", symlink_escape_is_denied);
+    run_case(
+        "runtime_hardlink_escape_is_denied",
+        runtime_hardlink_escape_is_denied,
+    );
     run_case("symlink_target_is_rejected", symlink_target_is_rejected);
     run_case(
         "cargo_cache_symlink_is_rejected",
@@ -97,9 +101,13 @@ fn linux_sandbox_acceptance_matrix() {
 }
 
 fn run_case(name: &str, case: fn()) {
+    let started = Instant::now();
     eprintln!("cargo-cage integration: {name} ...");
     case();
-    eprintln!("cargo-cage integration: {name}: ok");
+    eprintln!(
+        "cargo-cage integration: {name}: ok ({:.2}s)",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 fn simple_build_works() {
@@ -226,7 +234,7 @@ fn project_toolchain_path_is_rejected_before_compiler_execution() {
     rustup_probe
         .args(["which", "rustc"])
         .env_remove("RUSTUP_TOOLCHAIN");
-    let rustup_output = rustup_probe.output();
+    let rustup_output = try_run_output(&mut rustup_probe, "rustup which rustc probe");
     let Ok(rustup_output) = rustup_output else {
         return;
     };
@@ -278,7 +286,7 @@ fn project_toolchain_path_is_rejected_before_compiler_execution() {
     command.env("RUSTC", "rustup");
     command.env("RUSTUP_HOME", &rustup_home);
     command.env_remove("RUSTUP_TOOLCHAIN");
-    let output = command.output().expect("run cargo-cage");
+    let output = run_output(&mut command, "cargo-cage project toolchain override");
     assert!(!output.status.success(), "unexpected toolchain success");
     let text = output_text(&output);
     assert!(
@@ -316,7 +324,7 @@ fn inherited_file_descriptors_do_not_reach_the_build() {
         .env_remove("CARGO_BUILD_TARGET_DIR");
     apply_rustup_home(&mut command);
 
-    let output = command.output().expect("run cargo-cage with inherited fd");
+    let output = run_output(&mut command, "cargo-cage inherited file descriptor");
     assert_policy_failure(&output);
     assert_eq!(
         fs::read(&secret).expect("read inherited fd fixture"),
@@ -330,6 +338,7 @@ fn parent_death_kills_nested_builds() {
     let finished = fixture.file("target/parent-death-finished");
     let mut command = base_command_for(&fixture, "build");
     command.args(["--features", "parent-death"]);
+    eprintln!("cargo-cage subprocess: parent-death build: spawning ...");
     let mut child = command.spawn().expect("spawn cargo-cage parent-death test");
 
     for _ in 0..50 {
@@ -340,6 +349,7 @@ fn parent_death_kills_nested_builds() {
     }
     assert!(started.is_file(), "parent-death fixture did not start");
 
+    eprintln!("cargo-cage subprocess: parent-death build: marker observed, killing parent");
     child.kill().expect("kill cargo-cage parent");
     let _ = child.wait().expect("wait for killed cargo-cage");
     thread::sleep(Duration::from_secs(3));
@@ -458,6 +468,18 @@ fn symlink_escape_is_denied() {
     assert!(!external.exists());
 }
 
+fn runtime_hardlink_escape_is_denied() {
+    let fixture = materialize("malicious-build-script").expect("malicious fixture");
+    let source = fixture.file("Cargo.toml");
+    let source_before = fs::read(&source).expect("read manifest before build");
+    let output = run_cage_feature(&fixture, "runtime-hardlink-escape", &[]);
+    assert_policy_failure(&output);
+    assert_eq!(
+        fs::read(&source).expect("read manifest after build"),
+        source_before
+    );
+}
+
 fn symlink_target_is_rejected() {
     use std::os::unix::fs::symlink;
 
@@ -566,7 +588,7 @@ fn missing_backend_fails_closed() {
     let fixture = materialize("simple-build").expect("simple fixture");
     let mut command = base_command(&fixture);
     command.env("CARGO_CAGE_BWRAP", "/definitely/missing/bwrap");
-    let output = command.output().expect("run cargo-cage");
+    let output = run_output(&mut command, "cargo-cage missing Bubblewrap");
     assert!(!output.status.success());
     let text = output_text(&output);
     assert!(
@@ -594,7 +616,7 @@ fn defective_backend_fails_closed() {
 
     let mut command = base_command(&fixture);
     command.env("CARGO_CAGE_BWRAP", &fake_bwrap);
-    let output = command.output().expect("run cargo-cage");
+    let output = run_output(&mut command, "cargo-cage defective Bubblewrap");
     assert!(!output.status.success());
     let text = output_text(&output);
     assert!(
@@ -622,7 +644,7 @@ fn old_backend_fails_closed() {
 
     let mut command = base_command(&fixture);
     command.env("CARGO_CAGE_BWRAP", &old_bwrap);
-    let output = command.output().expect("run cargo-cage");
+    let output = run_output(&mut command, "cargo-cage old Bubblewrap");
     assert!(!output.status.success());
     let text = output_text(&output);
     assert!(
@@ -635,20 +657,22 @@ fn old_backend_fails_closed() {
 fn run_cage(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
     let mut command = base_command_for(fixture, "build");
     apply_extra_environment(&mut command, extra);
-    command.output().expect("run cargo-cage")
+    run_output(&mut command, "cargo-cage build")
 }
 
 fn run_cage_feature(fixture: &Fixture, feature: &str, extra: &[(&str, &str)]) -> Output {
     let mut command = base_command_for(fixture, "build");
     command.args(["--features", feature]);
     apply_extra_environment(&mut command, extra);
-    command.output().expect("run cargo-cage")
+    let label = format!("cargo-cage build --features {feature}");
+    run_output(&mut command, &label)
 }
 
 fn run_cage_command(fixture: &Fixture, cargo_command: &str, extra: &[(&str, &str)]) -> Output {
     let mut command = base_command_for(fixture, cargo_command);
     apply_extra_environment(&mut command, extra);
-    command.output().expect("run cargo-cage")
+    let label = format!("cargo-cage {cargo_command}");
+    run_output(&mut command, &label)
 }
 
 fn run_doctor(fixture: &Fixture, verbose: bool) -> Output {
@@ -665,7 +689,7 @@ fn run_doctor(fixture: &Fixture, verbose: bool) -> Output {
         command.arg("--verbose");
     }
     apply_rustup_home(&mut command);
-    command.output().expect("run cargo-cage doctor")
+    run_output(&mut command, "cargo-cage doctor")
 }
 
 fn run_cage_with_cargo_home(
@@ -678,7 +702,7 @@ fn run_cage_with_cargo_home(
     for (key, value) in extra {
         command.env(key, value);
     }
-    command.output().expect("run cargo-cage")
+    run_output(&mut command, "cargo-cage build with custom Cargo home")
 }
 
 fn run_cage_feature_with_cargo_home(
@@ -692,7 +716,24 @@ fn run_cage_feature_with_cargo_home(
         .args(["--features", feature])
         .env("CARGO_HOME", cargo_home);
     apply_extra_environment(&mut command, extra);
-    command.output().expect("run cargo-cage")
+    let label = format!("cargo-cage build --features {feature} with custom Cargo home");
+    run_output(&mut command, &label)
+}
+
+fn run_output(command: &mut Command, label: &str) -> Output {
+    try_run_output(command, label).unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+fn try_run_output(command: &mut Command, label: &str) -> std::io::Result<Output> {
+    let started = Instant::now();
+    eprintln!("cargo-cage subprocess: {label} ...");
+    let output = command.output()?;
+    eprintln!(
+        "cargo-cage subprocess: {label}: exit={:?} ({:.2}s)",
+        output.status.code(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(output)
 }
 
 fn base_command_for(fixture: &Fixture, cargo_command: &str) -> Command {
