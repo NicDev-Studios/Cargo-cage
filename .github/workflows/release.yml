@@ -3,7 +3,9 @@ name: Publish crates.io release
 on:
   push:
     tags:
-      - "v*"
+      # Cargo release tags are semver-shaped. The shorter v1 tag is reserved
+      # for the GitHub Action major-version pointer.
+      - "v*.*.*"
 
 permissions:
   contents: read

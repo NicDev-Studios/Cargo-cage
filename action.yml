@@ -1,0 +1,73 @@
+name: cargo-cage
+description: Run a Cargo command inside the cargo-cage Linux sandbox.
+author: NicDevTV
+
+inputs:
+  command:
+    description: Cargo command to run (build, check, test, or doc).
+    required: false
+    default: build
+  args:
+    description: Space-separated arguments passed to Cargo through cargo-cage.
+    required: false
+    default: --locked
+  cargo-cage-version:
+    description: Exact cargo-cage version to install from crates.io.
+    required: false
+    default: 0.1.0-alpha.1
+
+branding:
+  icon: shield
+  color: blue
+
+runs:
+  using: composite
+  steps:
+    - name: Check runner
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" != "Linux" ]]; then
+          echo "cargo-cage requires a Linux runner; got ${RUNNER_OS}." >&2
+          exit 1
+        fi
+
+    - name: Install Bubblewrap
+      shell: bash
+      run: bash "${{ github.action_path }}/.github/scripts/install-bubblewrap.sh"
+
+    - name: Install cargo-cage
+      shell: bash
+      env:
+        CARGO_CAGE_VERSION: ${{ inputs.cargo-cage-version }}
+      run: |
+        set -euo pipefail
+        cargo install cargo-cage --locked --version "${CARGO_CAGE_VERSION}"
+
+    - name: Check sandbox
+      shell: bash
+      run: cargo-cage doctor
+
+    - name: Run Cargo in the sandbox
+      shell: bash
+      env:
+        CARGO_CAGE_COMMAND: ${{ inputs.command }}
+        CARGO_CAGE_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+
+        case "${CARGO_CAGE_COMMAND}" in
+          build|check|test|doc) ;;
+          *)
+            echo "Unsupported cargo-cage command: ${CARGO_CAGE_COMMAND}" >&2
+            echo "Use build, check, test, or doc." >&2
+            exit 2
+            ;;
+        esac
+
+        cargo_args=()
+        if [[ -n "${CARGO_CAGE_ARGS}" ]]; then
+          read -r -a cargo_args <<< "${CARGO_CAGE_ARGS}"
+        fi
+
+        exec cargo-cage "${CARGO_CAGE_COMMAND}" "${cargo_args[@]}"

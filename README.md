@@ -84,6 +84,44 @@ The public crates are named consistently on crates.io:
 `cage-testkit` contains intentionally hostile fixtures and stays private to
 the workspace.
 
+## GitHub Actions
+
+For an Ubuntu 24.04 job, the repository also provides a small composite action:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fetch --locked
+      - uses: NicDev-Studios/Cargo-cage@v1
+```
+
+The action installs and checks Bubblewrap, installs the pinned cargo-cage
+version, runs `cargo-cage doctor`, and defaults to `cargo-cage build --locked`.
+Use `command: test`, `command: check`, or `command: doc` for the other supported
+Cargo operations. Additional arguments go in `args`:
+
+```yaml
+- uses: NicDev-Studios/Cargo-cage@v1
+  with:
+    command: test
+    args: --locked --workspace
+```
+
+`@v1` is the Action's Git tag, not the Cargo package version. The action pins
+the installed CLI to `0.1.0-alpha.1` by default; set `cargo-cage-version`
+explicitly when using another published version. For a supply-chain-sensitive
+workflow, pin the Action itself to a full commit SHA instead of the moving
+`v1` tag.
+
+The action does not fetch project dependencies automatically. `cargo fetch`
+stays an explicit step outside the cage. It currently supports Linux runners
+with an Ubuntu/Debian-style package manager; Ubuntu 24.04 is the reference
+setup.
+
 ## Offline preparation
 
 The cage does not fetch dependencies for you. Prepare dependencies as a
