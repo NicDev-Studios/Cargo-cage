@@ -135,6 +135,15 @@ stays an explicit step outside the cage. It currently supports Linux runners
 with an Ubuntu/Debian-style package manager; Ubuntu 24.04 is the reference
 setup.
 
+## Dependency checks
+
+The repository keeps its dependency graph deliberately small. Dependabot checks
+Cargo and GitHub Actions weekly, and the separate RustSec audit workflow scans
+`Cargo.lock` when dependency files change and once a week against the current
+advisory database. A clean audit means no matching advisory is known at that
+point; it is not a claim that the dependencies or the host toolchain are
+perfect.
+
 ## Offline preparation
 
 The cage does not fetch dependencies for you. Prepare dependencies as a

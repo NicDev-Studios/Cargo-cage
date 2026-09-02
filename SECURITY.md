@@ -106,3 +106,9 @@ Bubblewrap or a promise that every filesystem operation is observable.
 The workspace and selected runtime/toolchain files are readable by design.
 Data written to `target` is untrusted, and generated artifacts are not made
 safe to execute automatically.
+
+Dependency updates are checked weekly by Dependabot. The repository also runs
+RustSec's `cargo audit` workflow on dependency changes and on a weekly
+schedule. A clean audit only covers advisories known to RustSec at the time of
+the run; it is not a security guarantee for Bubblewrap, the kernel, Rust, or
+the dependency code itself.

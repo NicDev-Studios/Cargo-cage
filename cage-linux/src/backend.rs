@@ -290,6 +290,7 @@ enum MountSource {
 enum MountKind {
     Directory,
     File,
+    Executable,
     Special,
 }
 
@@ -406,7 +407,7 @@ impl PreparedMounts {
                 )
             })?
             .is_file()
-            .then_some(MountKind::File)
+            .then_some(MountKind::Executable)
             .ok_or_else(|| {
                 CageError::policy(
                     launcher.display().to_string(),
@@ -469,6 +470,7 @@ fn validate_opened_mount_kind(
     let valid = match kind {
         MountKind::Directory => metadata.is_dir(),
         MountKind::File => metadata.is_file() && metadata.nlink() == 1,
+        MountKind::Executable => metadata.is_file(),
         MountKind::Special => metadata.file_type().is_char_device(),
     };
     if valid {
@@ -477,6 +479,7 @@ fn validate_opened_mount_kind(
     let expected = match kind {
         MountKind::Directory => "directory",
         MountKind::File => "single-link regular file",
+        MountKind::Executable => "regular executable file",
         MountKind::Special => "character device",
     };
     Err(CageError::policy(
@@ -935,7 +938,7 @@ fn path_mount_arguments(plan: &SandboxPlan) -> MountArguments {
         launcher: Some(MountArgument {
             source: MountSource::Path(PathBuf::from("/proc/self/exe")),
             destination: PathBuf::from(crate::landlock::LAUNCHER_DESTINATION),
-            kind: MountKind::File,
+            kind: MountKind::Executable,
         }),
     }
 }
@@ -1149,6 +1152,7 @@ fn landlock_launcher_args(
         let option = match mount.kind {
             MountKind::Directory => "--landlock-write",
             MountKind::File => "--landlock-lockfile",
+            MountKind::Executable => unreachable!("executables cannot be writable mounts"),
             MountKind::Special => unreachable!("special files cannot be writable mounts"),
         };
         push_args(
@@ -2332,7 +2336,7 @@ mod tests {
             launcher: Some(MountArgument {
                 source: MountSource::Fd(104),
                 destination: PathBuf::from(crate::landlock::LAUNCHER_DESTINATION),
-                kind: MountKind::File,
+                kind: MountKind::Executable,
             }),
         };
 
@@ -2400,6 +2404,24 @@ mod tests {
                 .expect("device descriptor flags")
                 .contains(FdFlags::CLOEXEC)
         );
+    }
+
+    #[test]
+    fn accepts_a_hardlinked_read_only_launcher_source() {
+        let root = TestDirectory::new();
+        let launcher = root.path().join("cargo-cage");
+        let alias = root.path().join("cargo-cage-alias");
+        fs::write(&launcher, b"launcher").expect("write launcher fixture");
+        let mut permissions = fs::metadata(&launcher)
+            .expect("launcher metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launcher, permissions).expect("make launcher executable");
+        fs::hard_link(&launcher, &alias).expect("create launcher hardlink");
+
+        let fd = open_mount_source(&launcher, "test launcher").expect("open launcher");
+        validate_opened_mount_kind(&fd, MountKind::Executable, &launcher, "test launcher")
+            .expect("hardlinked executable is a valid read-only mount source");
     }
 
     #[test]
