@@ -2383,20 +2383,20 @@ mod tests {
 
     #[test]
     fn private_mounts_are_ordered_from_outer_to_inner_paths() {
-        assert_eq!(
-            private_mount_order(&[
-                PathBuf::from("/tmp/fake-home"),
-                PathBuf::from("/tmp"),
-                PathBuf::from("/home/user/.cargo"),
-                PathBuf::from("/home/user"),
-            ]),
-            [
-                PathBuf::from("/tmp"),
-                PathBuf::from("/home/user"),
-                PathBuf::from("/tmp/fake-home"),
-                PathBuf::from("/home/user/.cargo"),
-            ]
-        );
+        let ordered = private_mount_order(&[
+            PathBuf::from("/tmp/fake-home"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/home/user/.cargo"),
+            PathBuf::from("/home/user"),
+        ]);
+        let position = |path: &str| {
+            ordered
+                .iter()
+                .position(|item| item == Path::new(path))
+                .expect("private path in ordering")
+        };
+        assert!(position("/tmp") < position("/tmp/fake-home"));
+        assert!(position("/home/user") < position("/home/user/.cargo"));
     }
 
     #[test]

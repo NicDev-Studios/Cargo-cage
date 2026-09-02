@@ -54,6 +54,8 @@ jobs:
         run: cargo fetch --locked
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run fast unit tests
+        run: cargo test --workspace --lib --locked
       - name: Run tests
         run: timeout --signal=TERM --kill-after=15s 5m cargo test --workspace -- --nocapture
       - name: Run doctor smoke check
