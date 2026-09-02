@@ -632,6 +632,8 @@ impl SandboxPlan {
                 private_paths.push(cargo_home.clone());
             }
         }
+        private_paths.sort_by_key(|path| path.components().count());
+        private_paths.dedup();
 
         validate_read_only_paths(&read_only_paths, &private_paths, &hidden_paths)?;
         validate_writable_paths(
@@ -832,6 +834,14 @@ fn push_private_parent_directories(
 }
 
 #[cfg(target_os = "linux")]
+fn private_mount_order(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut ordered = paths.to_vec();
+    ordered.sort_by_key(|path| path.components().count());
+    ordered.dedup();
+    ordered
+}
+
+#[cfg(target_os = "linux")]
 fn push_mount_parent_directories(
     args: &mut Vec<OsString>,
     paths: &[PathBuf],
@@ -973,10 +983,10 @@ fn build_bwrap_args_with_mounts(
 
     push_private_parent_directories(&mut command, &plan.private_paths, &plan.runtime_mounts);
 
-    for path in &plan.private_paths {
+    for path in private_mount_order(&plan.private_paths) {
         push_args(
             &mut command,
-            [OsString::from("--tmpfs"), path.clone().into_os_string()],
+            [OsString::from("--tmpfs"), path.into_os_string()],
         );
     }
 
@@ -2369,6 +2379,24 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--landlock-network-deny"));
         assert!(!args.iter().any(|arg| arg == "--ro-bind"));
         assert!(!args.iter().any(|arg| arg == "--bind"));
+    }
+
+    #[test]
+    fn private_mounts_are_ordered_from_outer_to_inner_paths() {
+        assert_eq!(
+            private_mount_order(&[
+                PathBuf::from("/tmp/fake-home"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/home/user/.cargo"),
+                PathBuf::from("/home/user"),
+            ]),
+            [
+                PathBuf::from("/tmp"),
+                PathBuf::from("/home/user"),
+                PathBuf::from("/tmp/fake-home"),
+                PathBuf::from("/home/user/.cargo"),
+            ]
+        );
     }
 
     #[test]
