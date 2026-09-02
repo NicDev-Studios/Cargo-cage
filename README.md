@@ -144,6 +144,29 @@ advisory database. A clean audit means no matching advisory is known at that
 point; it is not a claim that the dependencies or the host toolchain are
 perfect.
 
+## Before pushing
+
+Run the repository's Rust-only local CI mirror before opening a pull request:
+
+```sh
+cargo run --manifest-path tools/ci-check/Cargo.toml --locked
+```
+
+On macOS this runs every portable check and prints an explicit skip for the
+Linux Bubblewrap/Landlock runtime. If the `x86_64-unknown-linux-gnu` Rust
+target is installed, it also compiles and lints the Linux code without running
+it. Run the same command with
+`-- --require-linux` on an Ubuntu 24.04 VM or machine when you want the local
+run to fail unless the real Linux sandbox checks execute:
+
+```sh
+cargo run --manifest-path tools/ci-check/Cargo.toml --locked -- --require-linux
+```
+
+The GitHub job still remains authoritative for the Ubuntu runtime, but a local
+failure should now be fixed before pushing instead of discovered after several
+CI cycles.
+
 ## Offline preparation
 
 The cage does not fetch dependencies for you. Prepare dependencies as a

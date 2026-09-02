@@ -48,32 +48,12 @@ jobs:
             end
             puts "action.yml: valid composite action metadata"
           '
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Fetch workspace dependencies
-        run: cargo fetch --locked
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Run fast unit tests
-        run: cargo test --workspace --lib --locked
-      - name: Run tests
-        run: timeout --signal=TERM --kill-after=15s 5m cargo test --workspace --locked -- --nocapture
-      - name: Run doctor smoke check
+      - name: Run Rust CI mirror
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=15s 2m \
-            cargo run --quiet --package cargo-cage --bin cargo-cage -- doctor
-      - name: Check independent red-team runner
-        run: cargo fmt --manifest-path security/redteam/Cargo.toml -- --check
-      - name: Run independent red-team runner
-        run: |
-          set -euo pipefail
-          cargo clippy --manifest-path security/redteam/Cargo.toml --all-targets --locked -- -D warnings
-          cargo build --package cargo-cage --locked
-          timeout --signal=TERM --kill-after=15s 10m \
-            cargo run --manifest-path security/redteam/Cargo.toml --locked -- \
-            --cargo-cage "$PWD/target/debug/cargo-cage" \
-            --iterations 64
+          timeout --signal=TERM --kill-after=15s 15m \
+            cargo run --manifest-path tools/ci-check/Cargo.toml --locked -- \
+            --require-linux
       - name: Exercise local composite action
         uses: ./
         with:

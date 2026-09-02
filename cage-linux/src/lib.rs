@@ -3,6 +3,8 @@
 mod backend;
 #[cfg(target_os = "linux")]
 mod landlock;
+#[cfg(target_os = "linux")]
+mod tree;
 
 pub use backend::LinuxSandbox;
 
