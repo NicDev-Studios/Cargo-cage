@@ -4,7 +4,10 @@ mod args;
 mod paths;
 mod policy;
 
-use cage_core::{CageError, CageResult, Environment, OutputMode, SandboxBackend, SandboxRequest};
+use cage_core::{
+    CageError, CageResult, Environment, OutputMode, SandboxBackend, SandboxRequest,
+    canonical_existing_path_without_symlinks, is_allowed_host_environment_name,
+};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -13,51 +16,6 @@ use std::process::Command;
 
 pub use args::{CargoCommand, CargoInvocation, help_text, is_help_request, parse_invocation};
 pub use paths::{inspect_lockfile, prepare_lockfile, prepare_target_dir, validate_target_dir};
-
-const SAFE_ENVIRONMENT_NAMES: &[&str] = &[
-    "USER",
-    "LOGNAME",
-    "LANG",
-    "LANGUAGE",
-    "LC_ALL",
-    "LC_ADDRESS",
-    "LC_COLLATE",
-    "LC_CTYPE",
-    "LC_IDENTIFICATION",
-    "LC_MEASUREMENT",
-    "LC_MESSAGES",
-    "LC_MONETARY",
-    "LC_NAME",
-    "LC_NUMERIC",
-    "LC_PAPER",
-    "LC_TELEPHONE",
-    "LC_TIME",
-    "TERM",
-    "COLORTERM",
-    "COLUMNS",
-    "LINES",
-    "CARGO_TERM_COLOR",
-    "CARGO_TERM_VERBOSE",
-    "CARGO_TERM_PROGRESS_WHEN",
-    "CARGO_INCREMENTAL",
-    "CARGO_BUILD_JOBS",
-    "CARGO_BUILD_TARGET",
-    "RUSTFLAGS",
-    "RUSTDOCFLAGS",
-    "CARGO_ENCODED_RUSTFLAGS",
-    "CARGO_ENCODED_RUSTDOCFLAGS",
-    "CC",
-    "CXX",
-    "AR",
-    "RANLIB",
-    "CFLAGS",
-    "CXXFLAGS",
-    "CPPFLAGS",
-    "PKG_CONFIG",
-    "PKG_CONFIG_PATH",
-    "PKG_CONFIG_LIBDIR",
-    "PKG_CONFIG_SYSROOT_DIR",
-];
 
 const STANDARD_RUNTIME_DIRECTORIES: &[&str] = &[
     "/usr/bin",
@@ -198,6 +156,9 @@ fn run_cargo(
     );
     eprintln!(
         "cargo-cage: a Cargo/build-script error such as Permission denied, Read-only file system, or Network is unreachable may indicate a denied operation; missing dependencies must be fetched separately with `cargo fetch`."
+    );
+    eprintln!(
+        "cargo-cage: remedy: inspect the native Cargo diagnostic, then adjust the build input or prepare missing dependencies outside the sandbox."
     );
 
     Ok(outcome.status.code.unwrap_or(1))
@@ -520,16 +481,11 @@ fn cargo_environment(
 fn safe_host_environment() -> Vec<(OsString, OsString)> {
     let mut values = Vec::new();
     for (key, value) in env::vars_os() {
-        if is_safe_environment_name(&key) {
+        if is_allowed_host_environment_name(&key) {
             values.push((key, value));
         }
     }
     values
-}
-
-fn is_safe_environment_name(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| SAFE_ENVIRONMENT_NAMES.contains(&name))
 }
 
 fn manifest_parent_path(args: &[OsString], current_dir: &Path) -> CageResult<Option<PathBuf>> {
@@ -1134,9 +1090,11 @@ fn workspace_from_output(
     let output = String::from_utf8_lossy(output);
     let manifest = output.trim();
     if manifest.is_empty() || manifest.contains('\n') || manifest.contains('\r') {
-        return Err(CageError::SandboxSetup(
-            "Cargo returned an invalid workspace manifest path; verify the manifest and rerun the build"
-                .to_owned(),
+        return Err(CageError::sandbox_setup(
+            "Cargo workspace discovery",
+            "locate-project must return exactly one manifest path",
+            "verify the manifest and rerun cargo-cage from the intended workspace",
+            "Cargo returned an invalid workspace manifest path",
         ));
     }
 
@@ -1184,59 +1142,6 @@ fn workspace_from_output(
         ));
     }
     Ok(workspace)
-}
-
-fn canonical_existing_path_without_symlinks(path: &Path, label: &str) -> CageResult<PathBuf> {
-    if !path.is_absolute() {
-        return Err(CageError::policy(
-            path.display().to_string(),
-            format!("the {label} must be an absolute path"),
-            "pass an absolute path or run cargo-cage from the intended workspace",
-        ));
-    }
-    if path
-        .components()
-        .any(|component| component == std::path::Component::ParentDir)
-    {
-        return Err(CageError::policy(
-            path.display().to_string(),
-            format!("the {label} must not contain parent-directory traversal"),
-            "pass the canonical path without `..` components",
-        ));
-    }
-
-    let mut current = PathBuf::new();
-    let mut components = path.components().peekable();
-    while let Some(component) = components.next() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current).map_err(|error| {
-            CageError::io(
-                format!("could not inspect {label} component {}", current.display()),
-                error,
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(CageError::policy(
-                path.display().to_string(),
-                format!("the {label} must not contain symlink components"),
-                "replace the symlink with a real path and retry",
-            ));
-        }
-        if components.peek().is_some() && !metadata.is_dir() {
-            return Err(CageError::policy(
-                current.display().to_string(),
-                format!("{label} parent components must be directories"),
-                "replace the conflicting file with a directory and retry",
-            ));
-        }
-    }
-
-    fs::canonicalize(path).map_err(|error| {
-        CageError::io(
-            format!("could not canonicalize {label} {}", path.display()),
-            error,
-        )
-    })
 }
 
 fn output_detail(output: &[u8]) -> String {
@@ -1599,7 +1504,7 @@ mod tests {
             "PKG_CONFIG_PATH",
             "LC_ALL",
         ] {
-            assert!(is_safe_environment_name(OsStr::new(name)), "{name}");
+            assert!(is_allowed_host_environment_name(OsStr::new(name)), "{name}");
         }
         for name in [
             "PATH",
@@ -1612,7 +1517,10 @@ mod tests {
             "SSH_AUTH_SOCK",
             "LC_SECRET",
         ] {
-            assert!(!is_safe_environment_name(OsStr::new(name)), "{name}");
+            assert!(
+                !is_allowed_host_environment_name(OsStr::new(name)),
+                "{name}"
+            );
         }
     }
 

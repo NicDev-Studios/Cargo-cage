@@ -1,6 +1,9 @@
 use cage_core::{CageError, CageResult, SandboxBackend, SandboxOutcome, SandboxRequest};
 #[cfg(target_os = "linux")]
-use cage_core::{Environment, NetworkAccess, OutputMode, ProcessStatus};
+use cage_core::{
+    Environment, NetworkAccess, OutputMode, ProcessStatus,
+    canonical_existing_path_without_symlinks, is_sensitive_environment_name,
+};
 #[cfg(target_os = "linux")]
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 #[cfg(target_os = "linux")]
@@ -14,6 +17,8 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::FileTypeExt;
@@ -26,6 +31,15 @@ use std::path::PathBuf;
 use std::path::{Component, Path};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 const MIN_BWRAP_MAJOR: u32 = 0;
@@ -37,6 +51,10 @@ const MIN_BWRAP_PATCH: u32 = 0;
 const CARGO_HOME_IN_SANDBOX: &str = "/run/cargo-cage-home";
 #[cfg(target_os = "linux")]
 const FD_SCRUBBER_SHELL: &str = "/bin/bash";
+#[cfg(target_os = "linux")]
+const MAX_CAPTURED_OUTPUT: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+static NEXT_LAUNCHER_CONTEXT_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 const NAMESPACE_PREFLIGHT_OUTPUT: &[u8] = b"cargo-cage-namespace-preflight-ok\n";
 #[cfg(target_os = "linux")]
@@ -167,12 +185,14 @@ impl LinuxSandbox {
         output_mode: OutputMode,
     ) -> CageResult<SandboxOutcome> {
         let mounts = PreparedMounts::open(plan, &self.launcher)?;
+        let launcher_context = LauncherContext::new()?;
         let mut command = Command::new(&self.bwrap);
         command.args(build_bwrap_args_with_mounts(
             plan,
             &mounts.arguments,
             program,
             args,
+            Some(launcher_context.file.as_raw_fd()),
         )?);
         command.current_dir(&plan.current_dir);
         if !plan.environment.inherit {
@@ -198,10 +218,20 @@ impl LinuxSandbox {
                 })
             }
             OutputMode::Capture => {
-                let output = command.stdin(Stdio::null()).output().map_err(|source| {
-                    CageError::ProcessSpawn {
-                        program: self.bwrap.clone(),
-                        source,
+                let output = capture_command_output(command).map_err(|source| {
+                    let detail = source.to_string();
+                    if detail.contains("safety limit") {
+                        CageError::sandbox_setup(
+                            self.bwrap.display().to_string(),
+                            "captured discovery output must stay below the safety limit",
+                            "fix the discovery command or retry with a normal Bubblewrap setup",
+                            detail,
+                        )
+                    } else {
+                        CageError::ProcessSpawn {
+                            program: self.bwrap.clone(),
+                            source,
+                        }
                     }
                 })?;
                 Ok(SandboxOutcome {
@@ -213,6 +243,173 @@ impl LinuxSandbox {
                 })
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_command_output(mut command: Command) -> std::io::Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("captured Bubblewrap stdout pipe was not created"));
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("captured Bubblewrap stderr pipe was not created"));
+    let (Ok(stdout), Ok(stderr)) = (stdout, stderr) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other(
+            "captured Bubblewrap output pipes could not be prepared",
+        ));
+    };
+
+    let stdout_over_limit = Arc::new(AtomicBool::new(false));
+    let stderr_over_limit = Arc::new(AtomicBool::new(false));
+    let stdout_flag = Arc::clone(&stdout_over_limit);
+    let stderr_flag = Arc::clone(&stderr_over_limit);
+    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_flag));
+    let stderr_reader = thread::spawn(move || read_capped(stderr, stderr_flag));
+
+    let mut killed_for_output = false;
+    let status = loop {
+        if (stdout_over_limit.load(Ordering::Relaxed) || stderr_over_limit.load(Ordering::Relaxed))
+            && !killed_for_output
+        {
+            let _ = child.kill();
+            killed_for_output = true;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| std::io::Error::other("captured Bubblewrap stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| std::io::Error::other("captured Bubblewrap stderr reader panicked"))??;
+    if stdout_over_limit.load(Ordering::Relaxed) || stderr_over_limit.load(Ordering::Relaxed) {
+        return Err(std::io::Error::other(format!(
+            "captured Bubblewrap output exceeded the {} byte safety limit",
+            MAX_CAPTURED_OUTPUT
+        )));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_capped<R: Read>(mut reader: R, over_limit: Arc<AtomicBool>) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                over_limit.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        if read == 0 {
+            return Ok(output);
+        }
+        let remaining = MAX_CAPTURED_OUTPUT.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining {
+            over_limit.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LauncherContext {
+    file: fs::File,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LauncherContext {
+    fn new() -> CageResult<Self> {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = env::temp_dir().join(format!(
+            "cargo-cage-launcher-context-{}-{}",
+            std::process::id(),
+            NEXT_LAUNCHER_CONTEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                CageError::sandbox_setup(
+                    path.display().to_string(),
+                    "the launcher context must be created as a private regular file",
+                    "make the system temporary directory writable and retry",
+                    format!("could not create the launcher context: {error}"),
+                )
+            })?;
+        file.write_all(crate::landlock::LAUNCHER_CONTEXT_CONTENT)
+            .and_then(|_| file.seek(SeekFrom::Start(0)))
+            .map_err(|error| {
+                CageError::sandbox_setup(
+                    path.display().to_string(),
+                    "the launcher context must contain the expected marker",
+                    "retry with a working temporary filesystem",
+                    format!("could not prepare the launcher context: {error}"),
+                )
+            })?;
+        let mut flags = fcntl_getfd(&file).map_err(|error| {
+            CageError::sandbox_setup(
+                path.display().to_string(),
+                "the launcher context descriptor must be transferable to Bubblewrap",
+                "use a working Linux fcntl implementation",
+                format!("could not inspect the launcher context descriptor: {error}"),
+            )
+        })?;
+        flags.remove(FdFlags::CLOEXEC);
+        fcntl_setfd(&file, flags).map_err(|error| {
+            CageError::sandbox_setup(
+                path.display().to_string(),
+                "the launcher context descriptor must be transferable to Bubblewrap",
+                "use a working Linux fcntl implementation",
+                format!("could not prepare the launcher context descriptor: {error}"),
+            )
+        })?;
+        fs::remove_file(&path).map_err(|error| {
+            CageError::sandbox_setup(
+                path.display().to_string(),
+                "the launcher context source must not remain addressable by a host path",
+                "retry with a working temporary filesystem",
+                format!("could not unlink the temporary launcher context: {error}"),
+            )
+        })?;
+        Ok(Self { file, path })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LauncherContext {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -247,10 +444,14 @@ impl SandboxBackend for LinuxSandbox {
                 || preflight.stdout != NAMESPACE_PREFLIGHT_OUTPUT
             {
                 let detail = sandbox_setup_detail(&preflight.stderr);
-                return Err(CageError::SandboxSetup(format!(
-                    "Bubblewrap could not activate the requested policy or complete its namespace preflight{}. Check unprivileged user namespaces and the host AppArmor policy before retrying",
-                    detail,
-                )));
+                return Err(CageError::sandbox_setup(
+                    "Bubblewrap namespace preflight",
+                    "requested namespaces, capabilities, session, and parent-death isolation must be verified",
+                    "enable unprivileged user namespaces and allow Bubblewrap under the host AppArmor policy",
+                    format!(
+                        "Bubblewrap could not activate the requested policy or complete its namespace preflight{detail}"
+                    ),
+                ));
             }
             self.run_inner(&plan, &request.program, &request.args, request.output)
         }
@@ -462,10 +663,12 @@ fn validate_opened_mount_kind(
     label: &str,
 ) -> CageResult<()> {
     let metadata = fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|error| {
-        CageError::SandboxSetup(format!(
-            "could not verify the opened {label} source {}: {error}; rule: the mounted FD type must match the validated path type; remedy: retry with a stable regular file or directory",
-            source.display()
-        ))
+        CageError::sandbox_setup(
+            source.display().to_string(),
+            "the mounted FD type must match the validated path type",
+            "retry with a stable regular file or directory",
+            format!("could not verify the opened {label} source: {error}"),
+        )
     })?;
     let valid = match kind {
         MountKind::Directory => metadata.is_dir(),
@@ -518,10 +721,12 @@ fn open_mount_source(path: &Path, label: &str) -> CageResult<OwnedFd> {
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|error| {
-        CageError::SandboxSetup(format!(
-            "could not open the host root for {label} source {} with openat2: {error}; rule: mount sources must be resolved from a stable host-root descriptor; remedy: run on a Linux kernel with openat2 support",
-            path.display()
-        ))
+        CageError::sandbox_setup(
+            path.display().to_string(),
+            "mount sources must be resolved from a stable host-root descriptor",
+            "run on a Linux kernel with openat2 support",
+            format!("could not open the host root for {label} source with openat2: {error}"),
+        )
     })?;
     let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
     let fd = openat2(
@@ -532,23 +737,29 @@ fn open_mount_source(path: &Path, label: &str) -> CageResult<OwnedFd> {
         resolve,
     )
     .map_err(|error| {
-        CageError::SandboxSetup(format!(
-            "could not open {label} source {} with openat2: {error}; rule: mount sources must be stable and symlink-free; remedy: remove the symlink or run on a Linux kernel with openat2 support",
-            path.display()
-        ))
+        CageError::sandbox_setup(
+            path.display().to_string(),
+            "mount sources must be stable and symlink-free",
+            "remove the symlink or run on a Linux kernel with openat2 support",
+            format!("could not open {label} source with openat2: {error}"),
+        )
     })?;
     let mut flags = fcntl_getfd(&fd).map_err(|error| {
-        CageError::SandboxSetup(format!(
-            "could not inspect the {label} file descriptor for {}: {error}; rule: mount descriptors must be transferable only to Bubblewrap; remedy: use a working Linux fcntl implementation",
-            path.display()
-        ))
+        CageError::sandbox_setup(
+            path.display().to_string(),
+            "mount descriptors must be transferable only to Bubblewrap",
+            "use a working Linux fcntl implementation",
+            format!("could not inspect the {label} file descriptor: {error}"),
+        )
     })?;
     flags.remove(FdFlags::CLOEXEC);
     fcntl_setfd(&fd, flags).map_err(|error| {
-        CageError::SandboxSetup(format!(
-            "could not prepare the {label} file descriptor for {}: {error}; rule: Bubblewrap must receive the validated mount descriptor; remedy: use a working Linux fcntl implementation",
-            path.display()
-        ))
+        CageError::sandbox_setup(
+            path.display().to_string(),
+            "Bubblewrap must receive the validated mount descriptor",
+            "use a working Linux fcntl implementation",
+            format!("could not prepare the {label} file descriptor: {error}"),
+        )
     })?;
     Ok(fd)
 }
@@ -569,7 +780,7 @@ impl SandboxPlan {
             .policy
             .writable_paths
             .iter()
-            .map(|path| canonical_path_without_symlink(path, "writable path"))
+            .map(|path| canonical_existing_path_without_symlinks(path, "writable path"))
             .collect::<CageResult<Vec<_>>>()?;
         let read_only_paths = request
             .policy
@@ -632,9 +843,6 @@ impl SandboxPlan {
                 private_paths.push(cargo_home.clone());
             }
         }
-        private_paths.sort_by_key(|path| path.components().count());
-        private_paths.dedup();
-
         validate_read_only_paths(&read_only_paths, &private_paths, &hidden_paths)?;
         validate_writable_paths(
             &writable_paths,
@@ -804,50 +1012,24 @@ fn validate_program_path(
 }
 
 #[cfg(target_os = "linux")]
-fn push_private_parent_directories(
+fn push_parent_directories(
     args: &mut Vec<OsString>,
-    private_paths: &[PathBuf],
+    paths: &[PathBuf],
+    blocked_paths: &[PathBuf],
     runtime_mounts: &[BindMount],
 ) {
-    let mut directories = Vec::new();
-    for path in private_paths {
-        let mut parent = path.parent();
-        while let Some(directory) = parent {
-            if directory == Path::new("/") {
-                break;
-            }
-            if runtime_mounts.iter().any(|mount| {
-                directory == mount.destination || directory.starts_with(&mount.destination)
-            }) {
-                break;
-            }
-            if !directories.iter().any(|item| item == directory) {
-                directories.push(directory.to_path_buf());
-            }
-            parent = directory.parent();
-        }
-    }
-    directories.sort_by_key(|path| path.components().count());
+    let directories = collect_parent_directories(paths, blocked_paths, runtime_mounts);
     for directory in directories {
         push_args(args, [OsString::from("--dir"), directory.into_os_string()]);
     }
 }
 
 #[cfg(target_os = "linux")]
-fn private_mount_order(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut ordered = paths.to_vec();
-    ordered.sort_by_key(|path| path.components().count());
-    ordered.dedup();
-    ordered
-}
-
-#[cfg(target_os = "linux")]
-fn push_mount_parent_directories(
-    args: &mut Vec<OsString>,
+fn collect_parent_directories(
     paths: &[PathBuf],
-    private_paths: &[PathBuf],
+    blocked_paths: &[PathBuf],
     runtime_mounts: &[BindMount],
-) {
+) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     for path in paths {
         let mut parent = path.parent();
@@ -855,9 +1037,9 @@ fn push_mount_parent_directories(
             if directory == Path::new("/") {
                 break;
             }
-            if private_paths
+            if blocked_paths
                 .iter()
-                .any(|private| directory == private || directory.starts_with(private))
+                .any(|blocked| directory == blocked || directory.starts_with(blocked))
                 || runtime_mounts.iter().any(|mount| {
                     directory == mount.destination || directory.starts_with(&mount.destination)
                 })
@@ -871,16 +1053,22 @@ fn push_mount_parent_directories(
         }
     }
     directories.sort_by_key(|path| path.components().count());
-    for directory in directories {
-        push_args(args, [OsString::from("--dir"), directory.into_os_string()]);
-    }
+    directories
+}
+
+#[cfg(target_os = "linux")]
+fn private_mount_order(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut ordered = paths.to_vec();
+    ordered.sort_by_key(|path| path.components().count());
+    ordered.dedup();
+    ordered
 }
 
 #[cfg(target_os = "linux")]
 #[cfg(test)]
 fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Vec<OsString> {
     let mounts = path_mount_arguments(plan);
-    build_bwrap_args_with_mounts(plan, &mounts, program, args)
+    build_bwrap_args_with_mounts(plan, &mounts, program, args, None)
         .expect("test mount arguments include the internal launcher")
 }
 
@@ -973,6 +1161,7 @@ fn build_bwrap_args_with_mounts(
     mounts: &MountArguments,
     program: &Path,
     args: &[OsString],
+    launcher_context_fd: Option<i32>,
 ) -> CageResult<Vec<OsString>> {
     let mut command = Vec::new();
     for mount in &mounts.runtime {
@@ -981,7 +1170,7 @@ fn build_bwrap_args_with_mounts(
     push_args(&mut command, ["--proc", "/proc"]);
     push_args(&mut command, ["--dev", "/dev"]);
 
-    push_private_parent_directories(&mut command, &plan.private_paths, &plan.runtime_mounts);
+    push_parent_directories(&mut command, &plan.private_paths, &[], &plan.runtime_mounts);
 
     for path in private_mount_order(&plan.private_paths) {
         push_args(
@@ -997,7 +1186,7 @@ fn build_bwrap_args_with_mounts(
             OsString::from(CARGO_HOME_IN_SANDBOX),
         ],
     );
-    push_mount_parent_directories(
+    push_parent_directories(
         &mut command,
         &plan.read_only_paths,
         &plan.private_paths,
@@ -1026,6 +1215,17 @@ fn build_bwrap_args_with_mounts(
 
     for mount in &mounts.writable {
         push_mount_argument(&mut command, false, mount);
+    }
+
+    if let Some(fd) = launcher_context_fd {
+        push_args(
+            &mut command,
+            [
+                OsString::from("--file"),
+                OsString::from(fd.to_string()),
+                OsString::from(crate::landlock::LAUNCHER_CONTEXT_DESTINATION),
+            ],
+        );
     }
 
     if plan.network == NetworkAccess::Deny {
@@ -1079,9 +1279,11 @@ fn build_bwrap_args_with_mounts(
     }
 
     let launcher = mounts.launcher.as_ref().ok_or_else(|| {
-        CageError::SandboxSetup(
-            "the internal Landlock launcher mount was not prepared for path /run/cargo-cage-landlock-launcher; rule: Cargo must start only after the Landlock launcher is mounted; remedy: rebuild cargo-cage from a complete installation"
-                .to_owned(),
+        CageError::sandbox_setup(
+            "/run/cargo-cage-landlock-launcher",
+            "Cargo must start only after the internal Landlock launcher is mounted",
+            "rebuild cargo-cage from a complete installation",
+            "the launcher mount was not prepared",
         )
     })?;
     push_mount_argument(&mut command, true, launcher);
@@ -1196,6 +1398,9 @@ fn landlock_launcher_args(
     if plan.network == NetworkAccess::Deny {
         command.push(OsString::from("--landlock-network-deny"));
     }
+    if plan.environment.inherit {
+        command.push(OsString::from("--landlock-inherit-environment"));
+    }
     command.push(OsString::from("--"));
     command.push(program.to_path_buf().into_os_string());
     command.extend(args.iter().cloned());
@@ -1220,7 +1425,7 @@ fn merged_environment(request: &SandboxRequest) -> Environment {
         }
     }
     for (key, _) in &request.environment.set {
-        if is_protected_environment_name(key) && !remove.contains(key) {
+        if is_sensitive_environment_name(key) && !remove.contains(key) {
             remove.push(key.clone());
         }
     }
@@ -1236,39 +1441,6 @@ fn merged_environment(request: &SandboxRequest) -> Environment {
         set,
         remove,
     }
-}
-
-#[cfg(target_os = "linux")]
-fn is_protected_environment_name(name: &OsString) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let name = name.to_ascii_uppercase();
-    name.starts_with("AWS_")
-        || name == "TOKEN"
-        || name.ends_with("_TOKEN")
-        || name.ends_with("_TOKENS")
-        || name == "PASSWORD"
-        || name.ends_with("_PASSWORD")
-        || name == "PASS"
-        || name.ends_with("_PASS")
-        || name == "SECRET"
-        || name.ends_with("_SECRET")
-        || name.ends_with("_SECRET_KEY")
-        || name == "CREDENTIAL"
-        || name.ends_with("_CREDENTIAL")
-        || name == "PRIVATE_KEY"
-        || name.ends_with("_PRIVATE_KEY")
-        || name == "API_KEY"
-        || name.ends_with("_API_KEY")
-        || name == "ACCESS_KEY"
-        || name.ends_with("_ACCESS_KEY")
-        || name.starts_with("SSH_")
-        || name.starts_with("GPG_")
-        || name.ends_with("_AGENT")
-        || name.ends_with("_AGENT_INFO")
-        || name.ends_with("_AGENT_PID")
-        || name.ends_with("_AUTH_SOCK")
 }
 
 #[cfg(target_os = "linux")]
@@ -1302,15 +1474,20 @@ fn parent_session_marker() -> CageResult<OsString> {
             source,
         })?;
     if !output.status.success() {
-        return Err(CageError::SandboxSetup(
-            "could not determine the parent session ID; install procps and retry".to_owned(),
+        return Err(CageError::sandbox_setup(
+            "/proc/self/session",
+            "the parent session ID must be known before Bubblewrap preflight",
+            "install procps and retry",
+            "could not determine the parent session ID",
         ));
     }
     let marker = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if marker.is_empty() || !marker.chars().all(|character| character.is_ascii_digit()) {
-        return Err(CageError::SandboxSetup(
-            "the parent session ID was invalid; install a working procps package and retry"
-                .to_owned(),
+        return Err(CageError::sandbox_setup(
+            "/proc/self/session",
+            "the parent session ID must be a numeric process-session identifier",
+            "install a working procps package and retry",
+            "the parent session ID was invalid",
         ));
     }
     Ok(marker.into())
@@ -1339,9 +1516,10 @@ fn host_cargo_home() -> CageResult<Option<PathBuf>> {
         ));
     }
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_dir() => {
-            Ok(Some(canonical_path_without_symlink(&path, "CARGO_HOME")?))
-        }
+        Ok(metadata) if metadata.is_dir() => Ok(Some(canonical_existing_path_without_symlinks(
+            &path,
+            "CARGO_HOME",
+        )?)),
         Ok(metadata) if metadata.file_type().is_symlink() => Err(CageError::policy(
             path.display().to_string(),
             "CARGO_HOME must not be a symlink",
@@ -1394,7 +1572,7 @@ fn validate_cargo_cache_paths(
             ));
         }
 
-        let cache = canonical_path_without_symlink(&path, "Cargo cache")?;
+        let cache = canonical_existing_path_without_symlinks(&path, "Cargo cache")?;
         validate_cache_source_policy(&cache, writable_paths, hidden_paths)?;
         validate_cache_tree(&cache)?;
         caches.push(cache);
@@ -1717,62 +1895,7 @@ fn canonical_existing_dir(path: &Path, label: &str) -> CageResult<PathBuf> {
             "replace the path with an existing real directory",
         ));
     }
-    canonical_path_without_symlink(path, label)
-}
-
-#[cfg(target_os = "linux")]
-fn canonical_path_without_symlink(path: &Path, label: &str) -> CageResult<PathBuf> {
-    if !path.is_absolute() {
-        return Err(CageError::policy(
-            path.display().to_string(),
-            format!("{label} must be an absolute path"),
-            "pass an absolute path before starting the sandbox",
-        ));
-    }
-    let mut current = PathBuf::new();
-    let mut components = path.components().peekable();
-    if path.to_string_lossy().split('/').any(|part| part == "..") {
-        return Err(CageError::policy(
-            path.display().to_string(),
-            format!("{label} must not contain parent-directory traversal"),
-            "pass the canonical path without `..` components",
-        ));
-    }
-    while let Some(component) = components.next() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => current.push(".."),
-            Component::Normal(part) => current.push(part),
-        }
-        let metadata = fs::symlink_metadata(&current).map_err(|error| {
-            CageError::io(
-                format!("could not inspect {label} {}", current.display()),
-                error,
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(CageError::policy(
-                path.display().to_string(),
-                format!("{label} must not contain symlink components"),
-                "replace the symlink component with a real directory or file",
-            ));
-        }
-        if components.peek().is_some() && !metadata.is_dir() {
-            return Err(CageError::policy(
-                current.display().to_string(),
-                format!("{label} parent components must be directories"),
-                "remove the conflicting file and retry with a directory path",
-            ));
-        }
-    }
-    fs::canonicalize(path).map_err(|error| {
-        CageError::io(
-            format!("could not canonicalize {label} {}", path.display()),
-            error,
-        )
-    })
+    canonical_existing_path_without_symlinks(path, label)
 }
 
 #[cfg(target_os = "linux")]
@@ -1794,7 +1917,7 @@ fn make_mask(path: &Path) -> CageResult<Option<MaskPath>> {
             "replace the symlink with a real file or directory before running cargo-cage",
         ));
     }
-    let resolved = canonical_path_without_symlink(path, "hidden path")?;
+    let resolved = canonical_existing_path_without_symlinks(path, "hidden path")?;
     if resolved == Path::new("/") {
         return Err(CageError::policy(
             path.display().to_string(),
@@ -1952,7 +2075,8 @@ fn default_launcher() -> CageResult<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn validate_launcher_executable(path: PathBuf) -> CageResult<PathBuf> {
-    let canonical = canonical_path_without_symlink(&path, "Landlock launcher executable")?;
+    let canonical =
+        canonical_existing_path_without_symlinks(&path, "Landlock launcher executable")?;
     let metadata = fs::metadata(&canonical).map_err(|error| {
         CageError::io(
             format!(
@@ -2355,6 +2479,7 @@ mod tests {
             &mounts,
             Path::new("/usr/bin/cargo"),
             &[OsString::from("build")],
+            Some(105),
         )
         .expect("fd mount arguments");
 
@@ -2371,6 +2496,12 @@ mod tests {
             "--ro-bind-fd",
             "104",
             crate::landlock::LAUNCHER_DESTINATION
+        ));
+        assert!(contains_pair(
+            &args,
+            "--file",
+            "105",
+            crate::landlock::LAUNCHER_CONTEXT_DESTINATION
         ));
         assert!(
             args.iter()
@@ -2743,8 +2874,9 @@ mod tests {
 
     #[test]
     fn rejects_relative_mount_paths() {
-        let error = canonical_path_without_symlink(Path::new("relative/path"), "writable path")
-            .expect_err("relative writable path");
+        let error =
+            canonical_existing_path_without_symlinks(Path::new("relative/path"), "writable path")
+                .expect_err("relative writable path");
         let text = error.to_string();
         assert!(text.contains("absolute path"), "{text}");
         assert!(text.contains("remedy:"), "{text}");
@@ -2752,8 +2884,9 @@ mod tests {
 
     #[test]
     fn rejects_parent_directory_traversal_in_mount_paths() {
-        let error = canonical_path_without_symlink(Path::new("/workspace/../outside"), "target")
-            .expect_err("parent traversal");
+        let error =
+            canonical_existing_path_without_symlinks(Path::new("/workspace/../outside"), "target")
+                .expect_err("parent traversal");
         let text = error.to_string();
         assert!(text.contains("parent-directory traversal"), "{text}");
         assert!(text.contains("remedy:"), "{text}");
@@ -2802,6 +2935,30 @@ mod tests {
             &[PathBuf::from("/tmp/workspace")],
         )
         .expect("target below re-exposed workspace can be writable");
+    }
+
+    #[test]
+    fn captured_output_has_a_hard_memory_limit() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "/usr/bin/head -c 2000000 /dev/zero"]);
+        let error = capture_command_output(command).expect_err("oversized output");
+        assert!(error.to_string().contains("safety limit"));
+    }
+
+    #[test]
+    fn launcher_context_fd_survives_after_its_host_path_is_unlinked() {
+        let context = LauncherContext::new().expect("launcher context");
+        assert!(!context.path.exists());
+        assert!(
+            !fcntl_getfd(&context.file)
+                .expect("launcher context descriptor flags")
+                .contains(FdFlags::CLOEXEC)
+        );
+        let mut content = Vec::new();
+        (&context.file)
+            .read_to_end(&mut content)
+            .expect("read launcher context");
+        assert_eq!(content, crate::landlock::LAUNCHER_CONTEXT_CONTENT);
     }
 
     struct TestDirectory(PathBuf);

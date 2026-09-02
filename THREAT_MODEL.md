@@ -88,6 +88,12 @@ The supported Cargo operations are `build`, `check`, `test`, and `doc`. The
 direct executable form, for example `cargo-cage build`, is the security-
 canonical invocation.
 
+The internal Landlock launcher is reached only after Bubblewrap creates a
+private context marker. It rejects direct invocation without that marker and
+rejects filesystem-root policy paths. This prevents accidental use as a broad
+policy override; it does not turn the helper into an independently trusted
+security boundary.
+
 ## What this protects against
 
 - A build script reaching a host TCP service through the normal network path.
@@ -138,7 +144,8 @@ The independent Rust red-team runner in security/redteam is intentionally
 separate from the normal regression tests. It tries black-box writes, reads,
 sockets, process and namespace operations, target poisoning, and concurrent
 path swaps. A green run is useful evidence, not a proof against a kernel or
-sandbox vulnerability.
+sandbox vulnerability. It reports direct ptrace and bpf syscall probes as
+`NOT TESTED` rather than silently treating unavailable coverage as a pass.
 
 The dispatcher issue is worth spelling out: if the user runs `cargo cage
 build` and Cargo expands a repository or user alias named `cage`, `cargo-cage`

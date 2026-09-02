@@ -16,7 +16,10 @@ cargo run --manifest-path security/redteam/Cargo.toml --locked -- \
 
 The harness only uses local listeners and temporary files. It never sends
 traffic to an external service and it does not print secret-bearing process
-output. A missing attacker tool is an error, not a skipped pass.
+output. Each case prints progress and has a local timeout. A missing required
+attacker tool is an error, not a skipped pass. Direct ptrace and bpf syscall
+probes are currently reported explicitly as `NOT TESTED`; they are not counted
+as passing coverage.
 
 The harness can find ordinary policy bugs, but a green run is not a proof
 against kernel, Bubblewrap, toolchain, or concurrent-filesystem attacks.

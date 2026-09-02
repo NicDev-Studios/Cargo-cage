@@ -5,117 +5,151 @@ use std::env;
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[test]
 fn linux_sandbox_acceptance_matrix() {
-    run_case("simple_build_works", simple_build_works);
-    run_case(
+    let mut failures = Vec::new();
+    macro_rules! run {
+        ($name:literal, $case:ident $(,)?) => {
+            if !run_case($name, $case) {
+                failures.push($name);
+            }
+        };
+    }
+
+    run!("simple_build_works", simple_build_works);
+    run!(
         "fresh_target_is_retained_and_reported",
         fresh_target_is_retained_and_reported,
     );
-    run_case("proc_macro_build_works", proc_macro_build_works);
-    run_case(
+    run!("proc_macro_build_works", proc_macro_build_works);
+    run!(
         "supported_cargo_commands_work",
-        supported_cargo_commands_work,
+        supported_cargo_commands_work
     );
-    run_case("out_dir_is_writable", out_dir_is_writable);
-    run_case("doctor_is_non_mutating", doctor_is_non_mutating);
-    run_case(
+    run!("out_dir_is_writable", out_dir_is_writable);
+    run!("doctor_is_non_mutating", doctor_is_non_mutating);
+    run!(
         "sensitive_home_path_is_hidden",
-        sensitive_home_path_is_hidden,
+        sensitive_home_path_is_hidden
     );
-    run_case("host_home_socket_is_hidden", host_home_socket_is_hidden);
-    run_case(
+    run!("host_home_socket_is_hidden", host_home_socket_is_hidden);
+    run!(
         "sensitive_environment_is_removed",
         sensitive_environment_is_removed,
     );
-    run_case("cargo_config_is_hidden", cargo_config_is_hidden);
-    run_case("runtime_paths_are_hidden", runtime_paths_are_hidden);
-    run_case(
+    run!("cargo_config_is_hidden", cargo_config_is_hidden);
+    run!("runtime_paths_are_hidden", runtime_paths_are_hidden);
+    run!(
         "project_toolchain_path_is_rejected_before_compiler_execution",
         project_toolchain_path_is_rejected_before_compiler_execution,
     );
-    run_case(
+    run!(
         "inherited_file_descriptors_do_not_reach_the_build",
         inherited_file_descriptors_do_not_reach_the_build,
     );
-    run_case(
+    run!(
         "parent_death_kills_nested_builds",
-        parent_death_kills_nested_builds,
+        parent_death_kills_nested_builds
     );
-    run_case("workspace_write_is_denied", workspace_write_is_denied);
-    run_case("nested_child_inherits_policy", nested_child_inherits_policy);
-    run_case("network_is_denied", network_is_denied);
-    run_case(
+    run!("workspace_write_is_denied", workspace_write_is_denied);
+    run!("nested_child_inherits_policy", nested_child_inherits_policy);
+    run!("network_is_denied", network_is_denied);
+    run!(
         "workspace_special_file_is_rejected",
         workspace_special_file_is_rejected,
     );
-    run_case(
+    run!(
         "workspace_external_symlink_is_rejected",
         workspace_external_symlink_is_rejected,
     );
-    run_case(
+    run!(
         "workspace_external_hardlink_is_rejected",
         workspace_external_hardlink_is_rejected,
     );
-    run_case(
+    run!(
         "target_external_hardlink_is_rejected",
         target_external_hardlink_is_rejected,
     );
-    run_case(
+    run!(
         "incremental_build_hardlinks_are_allowed",
         incremental_build_hardlinks_are_allowed,
     );
-    run_case(
+    run!(
         "trusted_target_reuse_is_explicit",
-        trusted_target_reuse_is_explicit,
+        trusted_target_reuse_is_explicit
     );
-    run_case("symlink_escape_is_denied", symlink_escape_is_denied);
-    run_case(
+    run!("symlink_escape_is_denied", symlink_escape_is_denied);
+    run!(
         "runtime_hardlink_escape_is_denied",
         runtime_hardlink_escape_is_denied,
     );
-    run_case("symlink_target_is_rejected", symlink_target_is_rejected);
-    run_case(
+    run!("symlink_target_is_rejected", symlink_target_is_rejected);
+    run!(
         "cargo_cache_symlink_is_rejected",
         cargo_cache_symlink_is_rejected,
     );
-    run_case(
+    run!(
         "cargo_git_cache_symlink_is_rejected",
         cargo_git_cache_symlink_is_rejected,
     );
-    run_case(
+    run!(
         "cargo_cache_nested_symlink_is_rejected",
         cargo_cache_nested_symlink_is_rejected,
     );
-    run_case(
+    run!(
         "cargo_cache_special_file_is_rejected",
         cargo_cache_special_file_is_rejected,
     );
-    run_case(
+    run!(
         "cargo_cache_external_hardlink_is_rejected",
         cargo_cache_external_hardlink_is_rejected,
     );
-    run_case("missing_backend_fails_closed", missing_backend_fails_closed);
-    run_case("old_backend_fails_closed", old_backend_fails_closed);
-    run_case(
+    run!("missing_backend_fails_closed", missing_backend_fails_closed);
+    run!("old_backend_fails_closed", old_backend_fails_closed);
+    run!(
         "defective_backend_fails_closed",
-        defective_backend_fails_closed,
+        defective_backend_fails_closed
+    );
+    run!(
+        "internal_launcher_rejects_standalone_use",
+        internal_launcher_rejects_standalone_use
+    );
+
+    assert!(
+        failures.is_empty(),
+        "Linux sandbox acceptance cases failed: {}",
+        failures.join(", ")
     );
 }
 
-fn run_case(name: &str, case: fn()) {
+fn run_case(name: &str, case: fn()) -> bool {
     let started = Instant::now();
     eprintln!("cargo-cage integration: {name} ...");
-    case();
-    eprintln!(
-        "cargo-cage integration: {name}: ok ({:.2}s)",
-        started.elapsed().as_secs_f64()
-    );
+    let result = catch_unwind(AssertUnwindSafe(case));
+    match result {
+        Ok(()) => {
+            eprintln!(
+                "cargo-cage integration: {name}: ok ({:.2}s)",
+                started.elapsed().as_secs_f64()
+            );
+            true
+        }
+        Err(_) => {
+            eprintln!(
+                "cargo-cage integration: {name}: FAILED ({:.2}s)",
+                started.elapsed().as_secs_f64()
+            );
+            false
+        }
+    }
 }
 
 fn simple_build_works() {
@@ -373,14 +407,18 @@ fn parent_death_kills_nested_builds() {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    assert!(
-        find_file(&fixture.file("target"), "parent-death-started"),
-        "parent-death fixture did not start"
-    );
+    if !find_file(&fixture.file("target"), "parent-death-started") {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("parent-death fixture did not start");
+    }
 
     eprintln!("cargo-cage subprocess: parent-death build: marker observed, killing parent");
-    child.kill().expect("kill cargo-cage parent");
-    let _ = child.wait().expect("wait for killed cargo-cage");
+    if let Err(error) = child.kill() {
+        let _ = child.wait();
+        panic!("kill cargo-cage parent: {error}");
+    }
+    child.wait().expect("wait for killed cargo-cage");
     thread::sleep(Duration::from_secs(3));
     assert!(
         !find_file(&fixture.file("target"), "parent-death-finished"),
@@ -694,6 +732,19 @@ fn old_backend_fails_closed() {
     assert!(!fixture.file("target").exists());
 }
 
+fn internal_launcher_rejects_standalone_use() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cage-landlock-launcher"));
+    command.args([cage_linux::INTERNAL_LAUNCHER_ARG, "--", "/bin/true"]);
+    let output = run_output(&mut command, "standalone Landlock launcher");
+    assert!(!output.status.success(), "unexpected launcher success");
+    let text = output_text(&output);
+    assert!(
+        text.contains("launcher-context") || text.contains("Bubblewrap context"),
+        "{text}"
+    );
+    assert!(text.contains("remedy:"), "{text}");
+}
+
 fn run_cage(fixture: &Fixture, extra: &[(&str, &str)]) -> Output {
     let mut command = base_command_for(fixture, "build");
     apply_extra_environment(&mut command, extra);
@@ -767,13 +818,36 @@ fn run_output(command: &mut Command, label: &str) -> Output {
 fn try_run_output(command: &mut Command, label: &str) -> std::io::Result<Output> {
     let started = Instant::now();
     eprintln!("cargo-cage subprocess: {label} ...");
-    let output = command.output()?;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = wait_with_timeout(child, SUBPROCESS_TIMEOUT)?;
     eprintln!(
         "cargo-cage subprocess: {label}: exit={:?} ({:.2}s)",
         output.status.code(),
         started.elapsed().as_secs_f64()
     );
     Ok(output)
+}
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> std::io::Result<Output> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("sandbox subprocess exceeded {} seconds", timeout.as_secs()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn base_command_for(fixture: &Fixture, cargo_command: &str) -> Command {
@@ -850,6 +924,8 @@ fn assert_policy_failure(output: &Output) {
         text.contains("cargo-cage: Cargo build failed inside the Linux sandbox"),
         "{text}"
     );
+    assert!(text.contains("cargo-cage: policy active:"), "{text}");
+    assert!(text.contains("cargo-cage: remedy:"), "{text}");
 }
 
 fn assert_setup_policy_failure(output: &Output, rule_fragment: &str) {
@@ -886,14 +962,23 @@ fn output_text(output: &Output) -> String {
 }
 
 fn find_file(root: &Path, name: &str) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
     let Ok(entries) = fs::read_dir(root) else {
         return false;
     };
     entries.flatten().any(|entry| {
         let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return false;
+        };
         if path.file_name().and_then(|value| value.to_str()) == Some(name) {
-            true
-        } else if path.is_dir() {
+            metadata.is_file()
+        } else if metadata.is_dir() {
             find_file(&path, name)
         } else {
             false

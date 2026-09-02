@@ -1,6 +1,8 @@
-use cage_core::{CageError, CageResult, NetworkAccess, SandboxPolicy};
+use cage_core::{
+    CageError, CageResult, NetworkAccess, SandboxPolicy, is_sensitive_environment_name,
+};
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
@@ -102,62 +104,4 @@ fn sensitive_environment_names() -> Vec<OsString> {
         }
     }
     names
-}
-
-fn is_sensitive_environment_name(name: &OsStr) -> bool {
-    name.to_str().is_some_and(|name| {
-        let name = name.to_ascii_uppercase();
-        name.starts_with("AWS_")
-            || name == "TOKEN"
-            || name.ends_with("_TOKEN")
-            || name.ends_with("_TOKENS")
-            || name == "PASSWORD"
-            || name.ends_with("_PASSWORD")
-            || name == "PASS"
-            || name.ends_with("_PASS")
-            || name == "SECRET"
-            || name.ends_with("_SECRET")
-            || name.ends_with("_SECRET_KEY")
-            || name == "CREDENTIAL"
-            || name.ends_with("_CREDENTIAL")
-            || name == "PRIVATE_KEY"
-            || name.ends_with("_PRIVATE_KEY")
-            || name == "API_KEY"
-            || name.ends_with("_API_KEY")
-            || name == "ACCESS_KEY"
-            || name.ends_with("_ACCESS_KEY")
-            || name.starts_with("SSH_")
-            || name.starts_with("GPG_")
-            || name.ends_with("_AGENT")
-            || name.ends_with("_AGENT_INFO")
-            || name.ends_with("_AGENT_PID")
-            || name.ends_with("_AUTH_SOCK")
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_sensitive_environment_name;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn identifies_secret_and_agent_environment_names() {
-        for name in [
-            "AWS_PROFILE",
-            "SERVICE_TOKEN",
-            "SERVICE_PASSWORD",
-            "PASS",
-            "SERVICE_SECRET_KEY",
-            "SERVICE_PRIVATE_KEY",
-            "SERVICE_CREDENTIAL",
-            "SERVICE_API_KEY",
-            "SSH_AUTH_SOCK",
-            "CUSTOM_AGENT_INFO",
-        ] {
-            assert!(is_sensitive_environment_name(OsStr::new(name)), "{name}");
-        }
-        assert!(!is_sensitive_environment_name(OsStr::new(
-            "CARGO_TARGET_DIR"
-        )));
-    }
 }

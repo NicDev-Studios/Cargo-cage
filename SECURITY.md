@@ -66,6 +66,11 @@ There is no unsandboxed fallback. If Bubblewrap is absent, too old, not
 executable, cannot complete its preflight, or Landlock/openat2 cannot provide
 the required policy, the build stops.
 
+The Landlock launcher is deliberately context-bound: Bubblewrap creates a
+private marker before the launcher is reached, and the launcher rejects direct
+use without that marker as well as filesystem-root policy paths. The launcher
+is an implementation detail, not a second public sandbox interface.
+
 ## The invocation trap
 
 Use `cargo-cage build`, not `cargo cage build`, when this boundary matters.
@@ -106,6 +111,10 @@ Bubblewrap or a promise that every filesystem operation is observable.
 The workspace and selected runtime/toolchain files are readable by design.
 Data written to `target` is untrusted, and generated artifacts are not made
 safe to execute automatically.
+
+The validation pass is intentionally conservative and repeated for each
+Bubblewrap process. This can be noticeable on large workspaces and retained
+target trees; it is a reliability/security trade-off, not a completeness claim.
 
 Dependency updates are checked weekly by Dependabot. The repository also runs
 RustSec's `cargo audit` workflow on dependency changes and on a weekly

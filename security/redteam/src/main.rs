@@ -28,14 +28,17 @@ mod redteam {
     use std::net::{TcpListener, UdpSocket};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    const CASE_TIMEOUT: Duration = Duration::from_secs(60);
 
     const BUILD_HEADER: &str = r#"
 use std::env;
@@ -144,11 +147,11 @@ fn manifest_path(name: &str) -> PathBuf {
         }
 
         fn run(&self) -> io::Result<Output> {
-            self.base_command().output()
+            run_with_timeout(self.base_command())
         }
 
         fn run_reuse(&self) -> io::Result<Output> {
-            self.base_reuse_command().output()
+            run_with_timeout(self.base_reuse_command())
         }
 
         fn base_reuse_command(&self) -> Command {
@@ -174,7 +177,8 @@ fn manifest_path(name: &str) -> PathBuf {
 
         fn run_with_fd(&self, secret: &Path) -> io::Result<Output> {
             let binary = &self.cargo_cage;
-            Command::new("/bin/sh")
+            let mut command = Command::new("/bin/sh");
+            command
                 .current_dir(&self.workspace)
                 .args([
                     "-c",
@@ -190,8 +194,8 @@ fn manifest_path(name: &str) -> PathBuf {
                 .env("CARGO_HOME", &self.cargo_home)
                 .env_remove("CARGO_TARGET_DIR")
                 .env_remove("CARGO_BUILD_TARGET_DIR")
-                .env_remove("CARGO_CAGE_BWRAP")
-                .output()
+                .env_remove("CARGO_CAGE_BWRAP");
+            run_with_timeout(command)
         }
 
         fn sentinel(&self) -> io::Result<Vec<u8>> {
@@ -255,31 +259,73 @@ fn manifest_path(name: &str) -> PathBuf {
             "/usr/bin/python3",
         ])?;
 
-        normal_build(&config)?;
-        attack_environment(&config)?;
-        attack_home_files(&config)?;
-        attack_cargo_config(&config)?;
-        attack_lockfile_symlink(&config)?;
-        attack_lockfile_hardlink(&config)?;
-        attack_cache_symlink(&config)?;
-        attack_cache_nested_symlink(&config)?;
-        attack_cache_special_file(&config)?;
-        attack_workspace_write(&config)?;
-        attack_external_write(&config)?;
-        attack_target_write(&config)?;
-        attack_network(&config)?;
-        attack_unix_socket(&config)?;
-        attack_abstract_unix_socket(&config)?;
-        attack_file_descriptor(&config)?;
-        attack_runtime_paths(&config)?;
-        attack_namespace_tools(&config)?;
-        attack_child_process(&config)?;
-        attack_target_hardlink(&config)?;
-        attack_target_symlink(&config)?;
-        attack_target_freshness(&config)?;
-        attack_path_swap(&config)?;
+        let mut failures = Vec::new();
+        macro_rules! run {
+            ($name:literal, $attack:ident) => {
+                if let Err(error) = run_case(&config, $name, $attack) {
+                    failures.push(error);
+                }
+            };
+        }
+
+        run!("normal-build", normal_build);
+        run!("environment", attack_environment);
+        run!("home-files", attack_home_files);
+        run!("cargo-config", attack_cargo_config);
+        run!("lockfile-symlink", attack_lockfile_symlink);
+        run!("lockfile-hardlink", attack_lockfile_hardlink);
+        run!("cache-symlink", attack_cache_symlink);
+        run!("cache-nested-symlink", attack_cache_nested_symlink);
+        run!("cache-special-file", attack_cache_special_file);
+        run!("workspace-write", attack_workspace_write);
+        run!("external-write", attack_external_write);
+        run!("target-write", attack_target_write);
+        run!("network", attack_network);
+        run!("dns-transport", attack_dns_transport);
+        run!("unix-socket", attack_unix_socket);
+        run!("abstract-unix-socket", attack_abstract_unix_socket);
+        run!("inherited-fd", attack_file_descriptor);
+        run!("runtime-paths", attack_runtime_paths);
+        run!("namespace-tools", attack_namespace_tools);
+        run!("child-process", attack_child_process);
+        run!("target-hardlink", attack_target_hardlink);
+        run!("target-symlink", attack_target_symlink);
+        run!("target-freshness", attack_target_freshness);
+        run!("path-swap", attack_path_swap);
+        eprintln!(
+            "cargo-cage redteam: NOT TESTED: direct ptrace and bpf syscall probes are not implemented; their absence is not treated as a pass"
+        );
+        if !failures.is_empty() {
+            return Err(format!(
+                "{} red-team cases failed:\n- {}",
+                failures.len(),
+                failures.join("\n- ")
+            ));
+        }
         eprintln!("cargo-cage redteam: all black-box attacks were denied");
         Ok(())
+    }
+
+    fn run_case<F>(config: &Config, name: &str, attack: F) -> Result<(), String>
+    where
+        F: FnOnce(&Config) -> Result<(), String>,
+    {
+        let started = Instant::now();
+        eprintln!("cargo-cage redteam: {name} ...");
+        let result = catch_unwind(AssertUnwindSafe(|| attack(config)))
+            .map_err(|_| format!("{name}: attacker probe panicked"))
+            .and_then(|result| result);
+        match &result {
+            Ok(()) => eprintln!(
+                "cargo-cage redteam: {name}: ok ({:.2}s)",
+                started.elapsed().as_secs_f64()
+            ),
+            Err(error) => eprintln!(
+                "cargo-cage redteam: {name}: FAILED ({:.2}s): {error}",
+                started.elapsed().as_secs_f64()
+            ),
+        }
+        result
     }
 
     pub fn print_help() {
@@ -397,7 +443,7 @@ denied("protected environment variables were not visible");
         ] {
             command.env(key, value);
         }
-        let output = command.output().map_err(io_text)?;
+        let output = run_with_timeout(command).map_err(io_text)?;
         let text = output_text(&output);
         for secret in [
             "redteam-secret",
@@ -669,6 +715,38 @@ denied("network connections were denied");
         drop(udp_listener);
         if udp_received {
             return Err("network attack reached the host UDP listener".to_owned());
+        }
+        result
+    }
+
+    fn attack_dns_transport(config: &Config) -> Result<(), String> {
+        let listener = UdpSocket::bind(("127.0.0.1", 0)).map_err(io_text)?;
+        listener
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .map_err(io_text)?;
+        let endpoint = listener.local_addr().map_err(io_text)?.to_string();
+        let case = new_attack(
+            config,
+            "dns-transport",
+            r#"
+let endpoint = fs::read_to_string(manifest_path("dns-endpoint")).expect("DNS endpoint");
+let socket = match UdpSocket::bind(("0.0.0.0", 0)) {
+    Ok(socket) => socket,
+    Err(_) => denied("DNS UDP socket creation was denied"),
+};
+let dns_query = [
+    0x13, 0x37, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+    0x00, 0x00, 0x01, 0x00, 0x01,
+];
+let _ = socket.send_to(&dns_query, endpoint.trim());
+denied("DNS-shaped UDP traffic was denied");
+"#,
+        )?;
+        fs::write(case.workspace.join("dns-endpoint"), endpoint).map_err(io_text)?;
+        let result = expect_denied(case);
+        if listener.recv_from(&mut [0_u8; 128]).is_ok() {
+            return Err("DNS-shaped UDP traffic reached the host listener".to_owned());
         }
         result
     }
@@ -1055,20 +1133,52 @@ match fs::write(target.join("sentinel"), b"race escape") {
         text
     }
 
+    fn run_with_timeout(mut command: Command) -> io::Result<Output> {
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + CASE_TIMEOUT;
+        loop {
+            if child.try_wait()?.is_some() {
+                return child.wait_with_output();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("red-team case exceeded {} seconds", CASE_TIMEOUT.as_secs()),
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn has_policy_context(text: &str) -> bool {
-        text.contains("CAGE_POLICY_DENIED")
+        (text.contains("CAGE_POLICY_DENIED") && text.contains("cargo-cage: remedy:"))
             || ((text.contains("sandbox policy error") || text.contains("sandbox setup failed"))
                 && text.contains("remedy:"))
     }
 
     fn find_file(root: &Path, name: &str) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(root) else {
+            return false;
+        };
+        if !metadata.is_dir() {
+            return false;
+        }
         let Ok(entries) = fs::read_dir(root) else {
             return false;
         };
         entries.flatten().any(|entry| {
             let path = entry.path();
-            path.file_name().and_then(|value| value.to_str()) == Some(name)
-                || (path.is_dir() && find_file(&path, name))
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                return false;
+            };
+            (path.file_name().and_then(|value| value.to_str()) == Some(name) && metadata.is_file())
+                || (metadata.is_dir() && find_file(&path, name))
         })
     }
 

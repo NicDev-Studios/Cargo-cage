@@ -240,12 +240,18 @@ that external sentinel files remain unchanged.
 ## Failure behaviour
 
 Policy and setup failures stop the operation before the real Cargo process is
-started. Errors name the path or variable involved, the rule that stopped the
-operation, and what to do next.
+started. Errors keep the subject, rule, remedy, and low-level setup detail
+separate internally, then print all four in a readable message.
 
 When Cargo itself fails, its normal output is left alone. `cargo-cage` adds a
 short note about the active policy; it does not pretend to audit every denied
 syscall or identify the exact line of a malicious script.
+
+The backend deliberately does a conservative path scan and a real Bubblewrap
+preflight before each Cargo process. Large workspaces or old retained target
+runs can therefore take a little longer. That cost is part of failing closed;
+the test harness also applies per-case timeouts so one broken fixture cannot
+hang the whole CI job forever.
 
 ## Limits
 
@@ -259,6 +265,11 @@ The path checks use safe Rust and the standard library. They are deliberately
 fail-closed, but they are not atomic against another local process changing
 the filesystem during setup. Files written under `target` are not trusted
 automatically, and generated binaries are not made safe to execute.
+
+The Landlock launcher is an implementation detail. It requires a marker file
+created by the Bubblewrap setup and rejects filesystem-root policy paths, so an
+installed launcher binary cannot accidentally be used as a general-purpose
+policy override. It is not a replacement for the outer Bubblewrap boundary.
 
 There is no Seccomp or resource limit, no GUI, no dependency reputation
 system, no AI detection, and no macOS/Windows backend here. Landlock itself

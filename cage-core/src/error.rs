@@ -26,13 +26,39 @@ impl PolicyViolation {
     }
 }
 
+/// Structured diagnostics for failures that happen while constructing or
+/// activating a sandbox, before the child process is allowed to run.
+#[derive(Debug)]
+pub struct SetupFailure {
+    pub subject: String,
+    pub rule: String,
+    pub remedy: String,
+    pub detail: String,
+}
+
+impl SetupFailure {
+    pub fn new(
+        subject: impl Into<String>,
+        rule: impl Into<String>,
+        remedy: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            rule: rule.into(),
+            remedy: remedy.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CageError {
     InvalidInvocation(String),
     Policy(PolicyViolation),
     UnsupportedPlatform,
     BackendUnavailable(String),
-    SandboxSetup(String),
+    SandboxSetup(SetupFailure),
     ProcessSpawn {
         program: PathBuf,
         source: io::Error,
@@ -54,6 +80,15 @@ impl CageError {
         remedy: impl Into<String>,
     ) -> Self {
         Self::Policy(PolicyViolation::new(subject, rule, remedy))
+    }
+
+    pub fn sandbox_setup(
+        subject: impl Into<String>,
+        rule: impl Into<String>,
+        remedy: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::SandboxSetup(SetupFailure::new(subject, rule, remedy, detail))
     }
 
     pub fn io(context: impl Into<String>, source: io::Error) -> Self {
@@ -79,7 +114,17 @@ impl fmt::Display for CageError {
             Self::BackendUnavailable(message) => {
                 write!(f, "Linux sandbox backend unavailable: {message}")
             }
-            Self::SandboxSetup(message) => write!(f, "sandbox setup failed: {message}"),
+            Self::SandboxSetup(failure) => {
+                write!(
+                    f,
+                    "sandbox setup failed for {}: {}; remedy: {}",
+                    failure.subject, failure.rule, failure.remedy
+                )?;
+                if !failure.detail.is_empty() {
+                    write!(f, " ({})", failure.detail)?;
+                }
+                Ok(())
+            }
             Self::ProcessSpawn { program, source } => {
                 write!(f, "could not start {}: {source}", program.display())
             }
@@ -120,5 +165,23 @@ mod tests {
         assert!(text.contains("must not contain symlinks"));
         assert!(text.contains("remedy:"));
         assert!(text.contains("replace the symlink"));
+    }
+
+    #[test]
+    fn setup_errors_keep_machine_readable_context() {
+        let error = CageError::sandbox_setup(
+            "/usr/bin/bwrap",
+            "Bubblewrap must be executable",
+            "install a working Bubblewrap binary",
+            "permission denied",
+        );
+        let CageError::SandboxSetup(failure) = &error else {
+            panic!("expected structured setup failure");
+        };
+        assert_eq!(failure.subject, "/usr/bin/bwrap");
+        assert_eq!(failure.rule, "Bubblewrap must be executable");
+        assert_eq!(failure.remedy, "install a working Bubblewrap binary");
+        assert_eq!(failure.detail, "permission denied");
+        assert!(error.to_string().contains("remedy:"));
     }
 }

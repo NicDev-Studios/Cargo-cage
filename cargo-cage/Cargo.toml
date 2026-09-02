@@ -11,6 +11,7 @@ description = "Run Cargo commands in an experimental Bubblewrap and Landlock san
 keywords = ["cargo", "sandbox", "security", "bubblewrap", "build-script"]
 categories = ["command-line-utilities", "development-tools::cargo-plugins", "os"]
 publish = true
+default-run = "cargo-cage"
 exclude = ["tests/**"]
 
 [lints]
