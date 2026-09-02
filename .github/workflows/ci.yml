@@ -58,6 +58,6 @@ jobs:
         uses: ./
         with:
           install-from-source: true
-          cargo-cage-version: 0.1.0-alpha.1
+          cargo-cage-version: 0.1.0-alpha.2
           command: build
           args: --locked --workspace

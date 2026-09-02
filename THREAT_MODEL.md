@@ -9,7 +9,7 @@ open sockets, or modify the checkout. `cargo-cage` tries to make that failure
 mode less painful on Linux.
 
 It is an experimental, local-build boundary. This first public alpha is
-`0.1.0-alpha.1`; it is not a proof of complete isolation.
+`0.1.0-alpha.2`; it is not a proof of complete isolation.
 
 ## Adversary
 

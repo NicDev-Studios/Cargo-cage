@@ -10,11 +10,11 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "cage-testkit"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "cargo-cage"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "cage-testkit",
  "cargo-cage-cargo",
@@ -24,18 +24,18 @@ dependencies = [
 
 [[package]]
 name = "cargo-cage-cargo"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "cargo-cage-core",
 ]
 
 [[package]]
 name = "cargo-cage-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "cargo-cage-linux"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "cargo-cage-core",
  "landlock",

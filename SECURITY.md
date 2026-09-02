@@ -1,6 +1,6 @@
 # Security
 
-Let's be direct: `cargo-cage 0.1.0-alpha.1` is experimental. It adds a useful Linux
+Let's be direct: `cargo-cage 0.1.0-alpha.2` is experimental. It adds a useful Linux
 boundary around Cargo, but it is not a complete sandbox and it does not come
 with a promise that hostile code can never escape. If you need a hard,
 independent trust boundary, use a VM or a dedicated build service as well.

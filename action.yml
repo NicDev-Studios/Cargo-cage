@@ -14,7 +14,7 @@ inputs:
   cargo-cage-version:
     description: Exact cargo-cage version to install from crates.io.
     required: false
-    default: 0.1.0-alpha.1
+    default: 0.1.0-alpha.2
   install-from-source:
     description: Install cargo-cage from the checked-out action source (for action development).
     required: false
