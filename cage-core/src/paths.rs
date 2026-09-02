@@ -37,9 +37,11 @@ pub fn canonical_existing_path_without_symlinks(path: &Path, label: &str) -> Cag
             Component::Normal(part) => current.push(part),
         }
         let metadata = fs::symlink_metadata(&current).map_err(|error| {
-            CageError::io(
-                format!("could not inspect {label} component {}", current.display()),
-                error,
+            CageError::sandbox_setup(
+                current.display().to_string(),
+                format!("the {label} path must remain present and symlink-free during validation"),
+                "restore the path and retry; concurrent path changes are not supported",
+                format!("could not inspect the path component: {error}"),
             )
         })?;
         if metadata.file_type().is_symlink() {
@@ -59,9 +61,11 @@ pub fn canonical_existing_path_without_symlinks(path: &Path, label: &str) -> Cag
     }
 
     fs::canonicalize(path).map_err(|error| {
-        CageError::io(
-            format!("could not canonicalize {label} {}", path.display()),
-            error,
+        CageError::sandbox_setup(
+            path.display().to_string(),
+            format!("the {label} path must remain canonical and symlink-free during validation"),
+            "restore the path and retry; concurrent path changes are not supported",
+            format!("could not canonicalize the path: {error}"),
         )
     })
 }

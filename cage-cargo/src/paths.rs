@@ -83,18 +83,15 @@ pub fn prepare_target_dir(path: PathBuf, workspace: &Path) -> CageResult<PathBuf
     let normalized = validate_target_dir(&path, workspace)?;
     create_directory_without_symlinks(&normalized)?;
     let target = fs::canonicalize(&normalized).map_err(|error| {
-        CageError::io(
-            format!(
-                "could not canonicalize target directory {}",
-                normalized.display()
-            ),
-            error,
+        target_setup_failure(
+            &normalized,
+            format!("could not canonicalize target directory: {error}"),
         )
     })?;
     let workspace = fs::canonicalize(workspace).map_err(|error| {
-        CageError::io(
-            format!("could not canonicalize workspace {}", workspace.display()),
-            error,
+        target_setup_failure(
+            workspace,
+            format!("could not canonicalize workspace: {error}"),
         )
     })?;
     if target == workspace || !target.starts_with(&workspace) {
@@ -132,9 +129,9 @@ pub fn prepare_fresh_target_dir(target: &Path, workspace: &Path) -> CageResult<P
         match fs::create_dir(&run) {
             Ok(()) => {
                 let metadata = fs::symlink_metadata(&run).map_err(|error| {
-                    CageError::io(
-                        format!("could not inspect new target run {}", run.display()),
-                        error,
+                    target_setup_failure(
+                        &run,
+                        format!("could not inspect the new target run: {error}"),
                     )
                 })?;
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -148,9 +145,9 @@ pub fn prepare_fresh_target_dir(target: &Path, workspace: &Path) -> CageResult<P
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(CageError::io(
-                    format!("could not create fresh target run {}", run.display()),
-                    error,
+                return Err(target_setup_failure(
+                    &run,
+                    format!("could not create the fresh target run: {error}"),
                 ));
             }
         }
@@ -173,9 +170,9 @@ pub fn validate_target_dir(path: &Path, workspace: &Path) -> CageResult<PathBuf>
         ));
     }
     let workspace = fs::canonicalize(workspace).map_err(|error| {
-        CageError::io(
-            format!("could not canonicalize workspace {}", workspace.display()),
-            error,
+        target_setup_failure(
+            workspace,
+            format!("could not canonicalize workspace: {error}"),
         )
     })?;
     let original_path = path;
@@ -260,9 +257,9 @@ fn validate_target_symlink_components(path: &Path, workspace: &Path) -> CageResu
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(error) => {
-                return Err(CageError::io(
-                    format!("could not inspect target path {}", current.display()),
-                    error,
+                return Err(target_setup_failure(
+                    &current,
+                    format!("could not inspect target path: {error}"),
                 ));
             }
         };
@@ -270,12 +267,9 @@ fn validate_target_symlink_components(path: &Path, workspace: &Path) -> CageResu
         if metadata.file_type().is_symlink() {
             let parent = current.parent().unwrap_or_else(|| Path::new("/"));
             let parent = fs::canonicalize(parent).map_err(|error| {
-                CageError::io(
-                    format!(
-                        "could not canonicalize target path parent {}",
-                        parent.display()
-                    ),
-                    error,
+                target_setup_failure(
+                    parent,
+                    format!("could not canonicalize target path parent: {error}"),
                 )
             })?;
             let resolved = fs::canonicalize(&current).map_err(|_| {
@@ -299,9 +293,11 @@ fn validate_target_symlink_components(path: &Path, workspace: &Path) -> CageResu
             is_directory = fs::metadata(&current)
                 .map(|metadata| metadata.is_dir())
                 .map_err(|error| {
-                    CageError::io(
-                        format!("could not inspect target path {}", current.display()),
-                        error,
+                    target_setup_failure(
+                        &current,
+                        format!(
+                            "could not inspect the target path after symlink resolution: {error}"
+                        ),
                     )
                 })?;
         }
@@ -372,16 +368,16 @@ fn create_directory_without_symlinks(path: &Path) -> CageResult<()> {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&current).map_err(|error| {
-                    CageError::io(
-                        format!("could not create target directory {}", current.display()),
-                        error,
+                    target_setup_failure(
+                        &current,
+                        format!("could not create target directory: {error}"),
                     )
                 })?;
             }
             Err(error) => {
-                return Err(CageError::io(
-                    format!("could not inspect target path {}", current.display()),
-                    error,
+                return Err(target_setup_failure(
+                    &current,
+                    format!("could not inspect target path: {error}"),
                 ));
             }
         }
@@ -434,26 +430,32 @@ fn canonicalize_with_missing_components(path: &Path) -> CageResult<PathBuf> {
                 existing.pop();
             }
             Err(error) => {
-                return Err(CageError::io(
-                    format!("could not inspect target path {}", existing.display()),
-                    error,
+                return Err(target_setup_failure(
+                    &existing,
+                    format!("could not inspect target path: {error}"),
                 ));
             }
         }
     }
     let mut canonical = fs::canonicalize(&existing).map_err(|error| {
-        CageError::io(
-            format!(
-                "could not canonicalize target parent {}",
-                existing.display()
-            ),
-            error,
+        target_setup_failure(
+            &existing,
+            format!("could not canonicalize target parent: {error}"),
         )
     })?;
     for component in missing.iter().rev() {
         canonical.push(component);
     }
     Ok(canonical)
+}
+
+fn target_setup_failure(path: &Path, detail: impl Into<String>) -> CageError {
+    CageError::sandbox_setup(
+        path.display().to_string(),
+        "target paths and their parents must remain real, present, and stable during setup",
+        "stop concurrent changes to the target path and retry",
+        detail,
+    )
 }
 
 #[cfg(test)]

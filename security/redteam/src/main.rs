@@ -945,7 +945,9 @@ match child {
             "target-hardlink",
             r#"
 let source = manifest_path("Cargo.toml");
-let alias = PathBuf::from(env::var_os("CARGO_TARGET_DIR").expect("target")).join("redteam-hardlink");
+let target = PathBuf::from(env::var_os("CARGO_TARGET_DIR").expect("target"));
+fs::create_dir_all(&target).expect("target directory");
+let alias = target.join("redteam-hardlink");
 match fs::hard_link(&source, &alias) {
     Ok(()) => bypass("target hardlink creation succeeded"),
     Err(_) => denied("target hardlink creation was denied"),
@@ -954,14 +956,15 @@ match fs::hard_link(&source, &alias) {
         )?;
         let manifest = case.workspace.join("Cargo.toml");
         let before = fs::read(&manifest).map_err(io_text)?;
-        let result = expect_denied(case);
-        if result.is_ok() {
-            let after = fs::read(&manifest).map_err(io_text)?;
-            if before != after {
-                return Err("target hardlink attack changed Cargo.toml".to_owned());
-            }
+        let sentinel_before = case.sentinel().map_err(io_text)?;
+        let output = case.run().map_err(io_text)?;
+        let after = fs::read(&manifest).map_err(io_text)?;
+        if before != after {
+            return fail_case(&case, "target hardlink attack changed Cargo.toml");
         }
-        result
+        check_denied_output(&case, &output, &sentinel_before, &[])?;
+        case.finish();
+        Ok(())
     }
 
     fn attack_target_symlink(config: &Config) -> Result<(), String> {
@@ -1091,26 +1094,36 @@ match fs::write(target.join("sentinel"), b"race escape") {
     fn expect_denied_with_secrets(case: Case, secrets: &[&str]) -> Result<(), String> {
         let before = case.sentinel().map_err(io_text)?;
         let output = case.run().map_err(io_text)?;
+        check_denied_output(&case, &output, &before, secrets)?;
+        case.finish();
+        Ok(())
+    }
+
+    fn check_denied_output(
+        case: &Case,
+        output: &Output,
+        sentinel_before: &[u8],
+        secrets: &[&str],
+    ) -> Result<(), String> {
         let after = case.sentinel().map_err(io_text)?;
-        if before != after {
-            return fail_case(&case, "attack changed the external sentinel");
+        if sentinel_before != after {
+            return fail_case(case, "attack changed the external sentinel");
         }
-        let text = output_text(&output);
+        let text = output_text(output);
         for secret in secrets {
             if text.contains(secret) {
-                return fail_case(&case, "attack leaked a secret value in process output");
+                return fail_case(case, "attack leaked a secret value in process output");
             }
         }
         if !has_policy_context(&text) {
             return fail_case(
-                &case,
+                case,
                 "attack failed without a recognizable sandbox policy diagnostic",
             );
         }
         if output.status.success() || text.contains("CAGE_POLICY_BYPASSED") {
-            return fail_output(&case, "black-box attack", &output);
+            return fail_output(case, "black-box attack", output);
         }
-        case.finish();
         Ok(())
     }
 
