@@ -5,6 +5,10 @@ use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TARGET_RUN: AtomicU64 = AtomicU64::new(0);
 
 pub fn manifest_path_arg(args: &[OsString]) -> CageResult<Option<OsString>> {
     let mut result = None;
@@ -101,6 +105,62 @@ pub fn prepare_target_dir(path: PathBuf, workspace: &Path) -> CageResult<PathBuf
         ));
     }
     Ok(target)
+}
+
+/// Create a new, symlink-free target run below an already validated target.
+pub fn prepare_fresh_target_dir(target: &Path, workspace: &Path) -> CageResult<PathBuf> {
+    let target = validate_target_dir(target, workspace)?;
+    create_directory_without_symlinks(&target)?;
+
+    let runs = target.join(".cargo-cage").join("runs");
+    create_directory_without_symlinks(&runs)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            CageError::policy(
+                target.display().to_string(),
+                format!("the target run clock was invalid: {error}"),
+                "check the host clock and retry with a normal target directory",
+            )
+        })?
+        .as_nanos();
+    let process = std::process::id();
+    let sequence = NEXT_TARGET_RUN.fetch_add(1, Ordering::Relaxed);
+
+    for attempt in 0..100_u32 {
+        let run = runs.join(format!("run-{timestamp}-{process}-{sequence}-{attempt}"));
+        match fs::create_dir(&run) {
+            Ok(()) => {
+                let metadata = fs::symlink_metadata(&run).map_err(|error| {
+                    CageError::io(
+                        format!("could not inspect new target run {}", run.display()),
+                        error,
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(CageError::policy(
+                        run.display().to_string(),
+                        "a fresh target run must be a real directory without symlink resolution",
+                        "remove the conflicting target-run entry and retry",
+                    ));
+                }
+                return Ok(run);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(CageError::io(
+                    format!("could not create fresh target run {}", run.display()),
+                    error,
+                ));
+            }
+        }
+    }
+
+    Err(CageError::policy(
+        runs.display().to_string(),
+        "a unique fresh target run could not be allocated",
+        "remove stale entries below target/.cargo-cage/runs and retry",
+    ))
 }
 
 /// Validate a target path without creating or modifying anything.
@@ -454,6 +514,21 @@ mod tests {
         assert_eq!(checked_target, target);
         assert!(!target.exists());
         assert!(!inspect_lockfile(&workspace).expect("inspect missing lockfile"));
+        assert!(!workspace.join("Cargo.lock").exists());
+    }
+
+    #[test]
+    fn creates_a_fresh_target_run_without_touching_the_workspace_lockfile() {
+        let root = TestDirectory::new();
+        let workspace_path = root.path().join("workspace");
+        fs::create_dir(&workspace_path).expect("create workspace");
+        let workspace = fs::canonicalize(workspace_path).expect("canonical workspace");
+        let target =
+            prepare_target_dir(workspace.join("target"), &workspace).expect("prepare target base");
+        let run = prepare_fresh_target_dir(&target, &workspace).expect("fresh target run");
+
+        assert!(run.starts_with(target.join(".cargo-cage").join("runs")));
+        assert!(run.is_dir());
         assert!(!workspace.join("Cargo.lock").exists());
     }
 

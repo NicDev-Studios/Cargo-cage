@@ -88,13 +88,18 @@ where
     match invocation {
         CargoInvocation::Help => Ok(0),
         CargoInvocation::Doctor { verbose } => run_doctor(verbose, backend),
-        CargoInvocation::Cargo { command, args } => run_cargo(command, args, backend),
+        CargoInvocation::Cargo {
+            command,
+            args,
+            reuse_target,
+        } => run_cargo(command, args, reuse_target, backend),
     }
 }
 
 fn run_cargo(
     command: CargoCommand,
     cargo_args: Vec<OsString>,
+    reuse_target: bool,
     backend: &dyn SandboxBackend,
 ) -> CageResult<i32> {
     let current_dir = canonical_current_dir()?;
@@ -102,12 +107,34 @@ fn run_cargo(
     let toolchain = resolve_toolchain(&cargo, &current_dir, command == CargoCommand::Doc)?;
     let workspace = locate_workspace(&toolchain, &current_dir, &cargo_args, backend)?;
     let target_dir = paths::target_dir_arg(&cargo_args, &current_dir, &workspace)?;
-    let target_dir = prepare_target_dir(target_dir, &workspace)?;
+    let target_base = prepare_target_dir(target_dir, &workspace)?;
+    let target_dir = if reuse_target {
+        target_base
+    } else {
+        paths::prepare_fresh_target_dir(&target_base, &workspace)?
+    };
     let build_dir = prepare_target_dir(target_dir.join("build"), &workspace)?;
     let lockfile = prepare_lockfile(&workspace)?;
     let sandbox_current_dir = sandbox_current_dir(&current_dir, &workspace, &cargo_args)?;
-    let cargo_args =
-        rewrite_relative_cargo_paths(&cargo_args, &current_dir, &sandbox_current_dir, &target_dir)?;
+    let cargo_args = rewrite_relative_cargo_paths(
+        &cargo_args,
+        &current_dir,
+        &sandbox_current_dir,
+        &target_dir,
+        !reuse_target,
+    )?;
+
+    if reuse_target {
+        eprintln!(
+            "cargo-cage: reusing target {}; this mode is intended only for a trusted workspace",
+            target_dir.display()
+        );
+    } else {
+        eprintln!(
+            "cargo-cage: using isolated target {}; artifacts are retained there",
+            target_dir.display()
+        );
+    }
 
     let mut sandbox_policy = policy::cargo_policy(true)?;
     sandbox_policy.read_only_paths.push(workspace.clone());
@@ -147,6 +174,12 @@ fn run_cargo(
 
     let outcome = backend.run(&request)?;
     if outcome.status.successfully_exited() {
+        if !reuse_target {
+            eprintln!(
+                "cargo-cage: isolated target retained at {}",
+                target_dir.display()
+            );
+        }
         return Ok(0);
     }
 
@@ -335,6 +368,7 @@ fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
         match backend.run(&probe) {
             Ok(outcome) if outcome.status.successfully_exited() => {
                 println!("  OK   Bubblewrap namespaces and sandbox preflight");
+                println!("  OK   Landlock ABI 5 filesystem enforcement");
             }
             Ok(outcome) => {
                 println!(
@@ -349,6 +383,10 @@ fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
             }
         }
     }
+
+    println!(
+        "  OK   target mode: fresh isolated run by default (use `--reuse-target` only for trusted workspaces)"
+    );
 
     if verbose {
         println!("  INFO no automatic dependency fetch is performed");
@@ -546,12 +584,10 @@ fn rewrite_relative_cargo_paths(
     current_dir: &Path,
     sandbox_current_dir: &Path,
     target_dir: &Path,
+    force_target_rewrite: bool,
 ) -> CageResult<Vec<OsString>> {
-    if current_dir == sandbox_current_dir {
-        return Ok(args.to_vec());
-    }
-
     let mut rewritten = args.to_vec();
+    let needs_directory_rewrite = current_dir != sandbox_current_dir;
     let mut index = 0;
     while index < rewritten.len() {
         if rewritten[index] == OsStr::new("--") {
@@ -560,7 +596,7 @@ fn rewrite_relative_cargo_paths(
         if rewritten[index] == OsStr::new("--manifest-path") {
             if let Some(value) = rewritten.get_mut(index + 1) {
                 let path = PathBuf::from(&*value);
-                if !path.is_absolute() {
+                if !path.is_absolute() && needs_directory_rewrite {
                     *value = resolved_manifest_path(args, current_dir)
                         .and_then(|manifest| {
                             manifest.ok_or_else(|| {
@@ -580,7 +616,7 @@ fn rewrite_relative_cargo_paths(
             .and_then(|arg| arg.strip_prefix("--manifest-path="))
         {
             let path = PathBuf::from(value);
-            if !path.is_absolute() {
+            if needs_directory_rewrite && !path.is_absolute() {
                 let manifest = resolved_manifest_path(args, current_dir)?.ok_or_else(|| {
                     CageError::InvalidInvocation("--manifest-path needs a value".to_owned())
                 })?;
@@ -591,7 +627,7 @@ fn rewrite_relative_cargo_paths(
         if rewritten[index] == OsStr::new("--target-dir") {
             if let Some(value) = rewritten.get_mut(index + 1) {
                 let path = PathBuf::from(&*value);
-                if !path.is_absolute() {
+                if force_target_rewrite || !path.is_absolute() {
                     *value = target_dir.as_os_str().to_os_string();
                 }
             }
@@ -607,7 +643,8 @@ fn rewrite_relative_cargo_paths(
                 .expect("checked UTF-8 target-dir argument")
                 .strip_prefix("--target-dir=")
                 .expect("checked target-dir argument");
-            if !Path::new(value).is_absolute() {
+            let path = Path::new(value);
+            if force_target_rewrite || !path.is_absolute() {
                 rewritten[index] = OsString::from("--target-dir=");
                 rewritten[index].push(target_dir.as_os_str());
             }
@@ -1313,7 +1350,9 @@ mod tests {
         assert_eq!(calls[1].args[2], OsString::from("--manifest-path"));
         assert_eq!(calls[1].args[3], manifest.into_os_string());
         assert_eq!(calls[1].args[4], OsString::from("--target-dir"));
-        assert_eq!(calls[1].args[5], target.into_os_string());
+        let isolated_target = PathBuf::from(&calls[1].args[5]);
+        assert!(isolated_target.starts_with(target.join(".cargo-cage").join("runs")));
+        assert!(isolated_target.is_dir());
         assert!(workspace.join("Cargo.lock").is_file());
     }
 
@@ -1385,10 +1424,47 @@ mod tests {
             current_dir,
             &sandbox_dir,
             &target,
+            false,
         )
         .expect("rewrite safe relative paths");
         assert_eq!(rewritten[1], workspace.join("Cargo.toml").into_os_string());
         assert_eq!(rewritten[3], target.into_os_string());
+    }
+
+    #[test]
+    fn fresh_target_mode_rewrites_even_an_absolute_target_argument() {
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let target = workspace.join("target");
+        let isolated = target.join(".cargo-cage/runs/run-1");
+        let rewritten = rewrite_relative_cargo_paths(
+            &[OsString::from("--target-dir"), target.into_os_string()],
+            &workspace,
+            &workspace,
+            &isolated,
+            true,
+        )
+        .expect("rewrite target path");
+        assert_eq!(rewritten[1], isolated.into_os_string());
+    }
+
+    #[test]
+    fn explicit_target_reuse_keeps_the_selected_absolute_target() {
+        let workspace = TestWorkspace::new();
+        let workspace = fs::canonicalize(&workspace.0).expect("canonical test workspace");
+        let target = workspace.join("target");
+        let rewritten = rewrite_relative_cargo_paths(
+            &[
+                OsString::from("--target-dir"),
+                target.clone().into_os_string(),
+            ],
+            &workspace,
+            &workspace,
+            &target,
+            false,
+        )
+        .expect("keep target path");
+        assert_eq!(rewritten[1], target.into_os_string());
     }
 
     #[test]

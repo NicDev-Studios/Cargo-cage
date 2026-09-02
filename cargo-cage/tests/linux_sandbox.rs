@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 #[test]
 fn linux_sandbox_acceptance_matrix() {
     run_case("simple_build_works", simple_build_works);
+    run_case(
+        "fresh_target_is_retained_and_reported",
+        fresh_target_is_retained_and_reported,
+    );
     run_case("proc_macro_build_works", proc_macro_build_works);
     run_case(
         "supported_cargo_commands_work",
@@ -66,6 +70,10 @@ fn linux_sandbox_acceptance_matrix() {
         "incremental_build_hardlinks_are_allowed",
         incremental_build_hardlinks_are_allowed,
     );
+    run_case(
+        "trusted_target_reuse_is_explicit",
+        trusted_target_reuse_is_explicit,
+    );
     run_case("symlink_escape_is_denied", symlink_escape_is_denied);
     run_case(
         "runtime_hardlink_escape_is_denied",
@@ -114,14 +122,34 @@ fn simple_build_works() {
     let fixture = materialize("simple-build").expect("simple fixture");
     let output = run_cage(&fixture, &[]);
     assert_success(&output);
-    assert!(fixture.file("target/debug/cage-simple-build").is_file());
+    assert!(find_file(&fixture.file("target"), "cage-simple-build"));
+}
+
+fn fresh_target_is_retained_and_reported() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let output = run_cage(&fixture, &[]);
+    assert_success(&output);
+    let text = output_text(&output);
+    let prefix = "cargo-cage: isolated target retained at ";
+    let target = text
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .map(PathBuf::from)
+        .expect("isolated target path in cargo-cage output");
+    assert!(target.is_dir(), "{}", target.display());
+    assert!(
+        target.starts_with(fixture.file("target/.cargo-cage/runs")),
+        "{}",
+        target.display()
+    );
+    assert!(target.join("debug/cage-simple-build").is_file());
 }
 
 fn proc_macro_build_works() {
     let fixture = materialize("proc-macro-build").expect("proc-macro fixture");
     let output = run_cage(&fixture, &[]);
     assert_success(&output);
-    assert!(fixture.file("target/debug/cage-proc-macro-build").is_file());
+    assert!(find_file(&fixture.file("target"), "cage-proc-macro-build"));
 }
 
 fn supported_cargo_commands_work() {
@@ -334,27 +362,28 @@ fn inherited_file_descriptors_do_not_reach_the_build() {
 
 fn parent_death_kills_nested_builds() {
     let fixture = materialize("malicious-build-script").expect("malicious fixture");
-    let started = fixture.file("target/parent-death-started");
-    let finished = fixture.file("target/parent-death-finished");
     let mut command = base_command_for(&fixture, "build");
     command.args(["--features", "parent-death"]);
     eprintln!("cargo-cage subprocess: parent-death build: spawning ...");
     let mut child = command.spawn().expect("spawn cargo-cage parent-death test");
 
     for _ in 0..50 {
-        if started.is_file() {
+        if find_file(&fixture.file("target"), "parent-death-started") {
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
-    assert!(started.is_file(), "parent-death fixture did not start");
+    assert!(
+        find_file(&fixture.file("target"), "parent-death-started"),
+        "parent-death fixture did not start"
+    );
 
     eprintln!("cargo-cage subprocess: parent-death build: marker observed, killing parent");
     child.kill().expect("kill cargo-cage parent");
     let _ = child.wait().expect("wait for killed cargo-cage");
     thread::sleep(Duration::from_secs(3));
     assert!(
-        !finished.exists(),
+        !find_file(&fixture.file("target"), "parent-death-finished"),
         "nested child survived cargo-cage parent"
     );
 }
@@ -453,6 +482,17 @@ fn incremental_build_hardlinks_are_allowed() {
     let first = run_cage(&fixture, &[]);
     assert_success(&first);
     let second = run_cage(&fixture, &[]);
+    assert_success(&second);
+}
+
+fn trusted_target_reuse_is_explicit() {
+    let fixture = materialize("simple-build").expect("simple fixture");
+    let mut first_command = base_reuse_command(&fixture);
+    let first = run_output(&mut first_command, "cargo-cage explicit target reuse");
+    assert_success(&first);
+    assert!(fixture.file("target/debug/cage-simple-build").is_file());
+    let mut second_command = base_reuse_command(&fixture);
+    let second = run_output(&mut second_command, "cargo-cage repeated target reuse");
     assert_success(&second);
 }
 
@@ -753,6 +793,21 @@ fn base_command_for(fixture: &Fixture, cargo_command: &str) -> Command {
 
 fn base_command(fixture: &Fixture) -> Command {
     base_command_for(fixture, "build")
+}
+
+fn base_reuse_command(fixture: &Fixture) -> Command {
+    let cargo_home = test_cargo_home(fixture);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cage"));
+    command
+        .current_dir(fixture.path())
+        .args(["--reuse-target", "build", "--manifest-path"])
+        .arg(fixture.file("Cargo.toml"))
+        .env("HOME", test_home(fixture))
+        .env("CARGO_HOME", cargo_home)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    apply_rustup_home(&mut command);
+    command
 }
 
 fn test_cargo_home(fixture: &Fixture) -> PathBuf {

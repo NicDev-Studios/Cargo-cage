@@ -23,8 +23,16 @@ supported baseline after the upstream
 
 The Linux backend mounts a small read-only runtime, the workspace, checked
 toolchain paths, and checked Cargo caches. The host root is not mounted as one
-giant read-only tree. `target` and the workspace `Cargo.lock` are the only
-persistent writable locations. `/tmp`, `/var/tmp`, and `/run` are private.
+giant read-only tree. Each command gets a new writable target run below
+target/.cargo-cage/runs/; the workspace Cargo.lock is a separate persistent
+writable file. /tmp, /var/tmp, and /run are private.
+
+Host mount sources are opened with fd-based, symlink-resistant resolution and
+passed to Bubblewrap with --ro-bind-fd or --bind-fd. After the namespace and
+mounts exist, a small internal Rust launcher applies a deny-by-default
+Landlock policy before it starts Cargo. Landlock ABI 5 is a hard requirement.
+When newer ABI features are available, pathname Unix-socket and scope
+restrictions are enabled as an additional layer.
 
 Network access is denied twice: Bubblewrap gets a separate network namespace,
 and Cargo is forced into offline mode. There is no automatic fetch.
@@ -55,7 +63,8 @@ procedural macros, test binaries, linkers, and compiler helpers inherit the
 same Bubblewrap boundary.
 
 There is no unsandboxed fallback. If Bubblewrap is absent, too old, not
-executable, or cannot complete its preflight, the build stops.
+executable, cannot complete its preflight, or Landlock/openat2 cannot provide
+the required policy, the build stops.
 
 ## The invocation trap
 
@@ -82,11 +91,17 @@ publishing details.
 
 ## Known limits
 
-This release deliberately has no Seccomp, Landlock, resource limits, or
-syscall audit log. It does not defend against kernel, Bubblewrap, Cargo, Rustc,
-toolchain, or host-policy vulnerabilities. It does not prevent resource DoS,
-fork bombs, side channels, every possible secret exposure, or races caused by
-another local process changing paths while setup is in progress.
+This release deliberately has no Seccomp, resource limits, or syscall audit
+log. It does not defend against kernel, Bubblewrap, Cargo, Rustc, toolchain, or
+host-policy vulnerabilities. It does not prevent resource DoS, fork bombs,
+side channels, every possible secret exposure, or all races caused by another
+local process changing paths while setup is in progress.
+
+The default target run is retained below target/.cargo-cage/runs/ and remains
+untrusted. --reuse-target is an explicit trusted-workspace exception and
+restores the older cross-build artifact risk. Landlock also has kernel-defined
+limits; it is an additional access-control layer, not a replacement for
+Bubblewrap or a promise that every filesystem operation is observable.
 
 The workspace and selected runtime/toolchain files are readable by design.
 Data written to `target` is untrusted, and generated artifacts are not made

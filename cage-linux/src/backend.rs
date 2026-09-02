@@ -2,6 +2,10 @@ use cage_core::{CageError, CageResult, SandboxBackend, SandboxOutcome, SandboxRe
 #[cfg(target_os = "linux")]
 use cage_core::{Environment, NetworkAccess, OutputMode, ProcessStatus};
 #[cfg(target_os = "linux")]
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+#[cfg(target_os = "linux")]
+use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::env;
@@ -10,10 +14,13 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::path::{Component, Path};
@@ -97,6 +104,8 @@ exec "$@"
 pub struct LinuxSandbox {
     #[cfg(target_os = "linux")]
     bwrap: PathBuf,
+    #[cfg(target_os = "linux")]
+    launcher: PathBuf,
 }
 
 impl LinuxSandbox {
@@ -109,18 +118,44 @@ impl LinuxSandbox {
         #[cfg(target_os = "linux")]
         {
             let bwrap = find_bwrap()?;
-            let version = bwrap_version(&bwrap)?;
-            if !version_at_least(version, (MIN_BWRAP_MAJOR, MIN_BWRAP_MINOR, MIN_BWRAP_PATCH)) {
-                return Err(CageError::BackendUnavailable(format!(
-                    "{} is too old; Bubblewrap >= {}.{}.{} is required; install a newer Bubblewrap or set CARGO_CAGE_BWRAP to a trusted absolute executable",
-                    bwrap.display(),
-                    MIN_BWRAP_MAJOR,
-                    MIN_BWRAP_MINOR,
-                    MIN_BWRAP_PATCH
-                )));
-            }
-            Ok(Self { bwrap })
+            let launcher = default_launcher()?;
+            Self::from_paths(bwrap, launcher)
         }
+    }
+
+    /// Construct the backend with an explicitly installed internal launcher.
+    ///
+    /// This is useful to applications embedding the public backend instead of
+    /// using the cargo-cage binary. The launcher is mounted read-only and still
+    /// receives the same generated deny-by-default policy.
+    pub fn with_launcher(path: impl Into<PathBuf>) -> CageResult<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path.into();
+            Err(CageError::UnsupportedPlatform)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let bwrap = find_bwrap()?;
+            let launcher = validate_launcher_executable(path.into())?;
+            Self::from_paths(bwrap, launcher)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_paths(bwrap: PathBuf, launcher: PathBuf) -> CageResult<Self> {
+        let version = bwrap_version(&bwrap)?;
+        if !version_at_least(version, (MIN_BWRAP_MAJOR, MIN_BWRAP_MINOR, MIN_BWRAP_PATCH)) {
+            return Err(CageError::BackendUnavailable(format!(
+                "{} is too old; Bubblewrap >= {}.{}.{} is required; install a newer Bubblewrap or set CARGO_CAGE_BWRAP to a trusted absolute executable",
+                bwrap.display(),
+                MIN_BWRAP_MAJOR,
+                MIN_BWRAP_MINOR,
+                MIN_BWRAP_PATCH
+            )));
+        }
+        Ok(Self { bwrap, launcher })
     }
 
     #[cfg(target_os = "linux")]
@@ -131,8 +166,14 @@ impl LinuxSandbox {
         args: &[OsString],
         output_mode: OutputMode,
     ) -> CageResult<SandboxOutcome> {
+        let mounts = PreparedMounts::open(plan, &self.launcher)?;
         let mut command = Command::new(&self.bwrap);
-        command.args(build_bwrap_args(plan, program, args));
+        command.args(build_bwrap_args_with_mounts(
+            plan,
+            &mounts.arguments,
+            program,
+            args,
+        )?);
         command.current_dir(&plan.current_dir);
         if !plan.environment.inherit {
             command.env_clear();
@@ -238,6 +279,279 @@ struct BindMount {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
+enum MountSource {
+    #[cfg(test)]
+    Path(PathBuf),
+    Fd(i32),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MountKind {
+    Directory,
+    File,
+    Special,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct MountArgument {
+    source: MountSource,
+    destination: PathBuf,
+    kind: MountKind,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Default)]
+struct MountArguments {
+    runtime: Vec<MountArgument>,
+    read_only: Vec<MountArgument>,
+    caches: Vec<MountArgument>,
+    hidden_files: Vec<MountArgument>,
+    writable: Vec<MountArgument>,
+    launcher: Option<MountArgument>,
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedMounts {
+    arguments: MountArguments,
+    _source_fds: Vec<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedMounts {
+    fn open(plan: &SandboxPlan, launcher: &Path) -> CageResult<Self> {
+        let mut arguments = MountArguments::default();
+        let mut source_fds = Vec::new();
+
+        for mount in &plan.runtime_mounts {
+            add_fd_mount(
+                &mut arguments.runtime,
+                &mut source_fds,
+                &mount.source,
+                &mount.destination,
+                MountKind::Directory,
+                "runtime mount",
+            )?;
+        }
+        for path in &plan.read_only_paths {
+            add_fd_mount(
+                &mut arguments.read_only,
+                &mut source_fds,
+                path,
+                path,
+                MountKind::Directory,
+                "read-only mount",
+            )?;
+        }
+        for source in &plan.cargo_cache_paths {
+            let destination = Path::new(CARGO_HOME_IN_SANDBOX).join(
+                source
+                    .file_name()
+                    .expect("cache path has a final component"),
+            );
+            add_fd_mount(
+                &mut arguments.caches,
+                &mut source_fds,
+                source,
+                &destination,
+                MountKind::Directory,
+                "Cargo cache mount",
+            )?;
+        }
+        for mask in &plan.hidden_paths {
+            if let MaskPath::File(path) = mask {
+                add_fd_mount(
+                    &mut arguments.hidden_files,
+                    &mut source_fds,
+                    Path::new("/dev/null"),
+                    path,
+                    MountKind::Special,
+                    "hidden-file mask",
+                )?;
+            }
+        }
+        for path in &plan.writable_paths {
+            let kind = fs::symlink_metadata(path)
+                .map(|metadata| {
+                    if metadata.is_dir() {
+                        MountKind::Directory
+                    } else {
+                        MountKind::File
+                    }
+                })
+                .map_err(|error| {
+                    CageError::io(
+                        format!("could not inspect writable mount {}", path.display()),
+                        error,
+                    )
+                })?;
+            add_fd_mount(
+                &mut arguments.writable,
+                &mut source_fds,
+                path,
+                path,
+                kind,
+                "writable mount",
+            )?;
+        }
+        let launcher_kind = fs::symlink_metadata(launcher)
+            .map_err(|error| {
+                CageError::io(
+                    format!(
+                        "could not inspect cargo-cage launcher {}",
+                        launcher.display()
+                    ),
+                    error,
+                )
+            })?
+            .is_file()
+            .then_some(MountKind::File)
+            .ok_or_else(|| {
+                CageError::policy(
+                    launcher.display().to_string(),
+                    "the internal Landlock launcher must be a regular file",
+                    "run cargo-cage from a real installed or freshly built executable",
+                )
+            })?;
+        let mut launcher_mount = Vec::new();
+        add_fd_mount(
+            &mut launcher_mount,
+            &mut source_fds,
+            launcher,
+            Path::new(crate::landlock::LAUNCHER_DESTINATION),
+            launcher_kind,
+            "Landlock launcher mount",
+        )?;
+        arguments.launcher = launcher_mount.pop();
+
+        Ok(Self {
+            arguments,
+            _source_fds: source_fds,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_fd_mount(
+    arguments: &mut Vec<MountArgument>,
+    source_fds: &mut Vec<OwnedFd>,
+    source: &Path,
+    destination: &Path,
+    kind: MountKind,
+    label: &str,
+) -> CageResult<()> {
+    let fd = open_mount_source(source, label)?;
+    validate_opened_mount_kind(&fd, kind, source, label)?;
+    let raw_fd = fd.as_raw_fd();
+    source_fds.push(fd);
+    arguments.push(MountArgument {
+        source: MountSource::Fd(raw_fd),
+        destination: destination.to_path_buf(),
+        kind,
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_opened_mount_kind(
+    fd: &OwnedFd,
+    kind: MountKind,
+    source: &Path,
+    label: &str,
+) -> CageResult<()> {
+    let metadata = fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|error| {
+        CageError::SandboxSetup(format!(
+            "could not verify the opened {label} source {}: {error}; rule: the mounted FD type must match the validated path type; remedy: retry with a stable regular file or directory",
+            source.display()
+        ))
+    })?;
+    let valid = match kind {
+        MountKind::Directory => metadata.is_dir(),
+        MountKind::File => metadata.is_file() && metadata.nlink() == 1,
+        MountKind::Special => metadata.file_type().is_char_device(),
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match kind {
+        MountKind::Directory => "directory",
+        MountKind::File => "single-link regular file",
+        MountKind::Special => "character device",
+    };
+    Err(CageError::policy(
+        source.display().to_string(),
+        format!("the opened {label} source type is not the required {expected}"),
+        "restore the validated source type and retry the sandboxed operation",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn open_mount_source(path: &Path, label: &str) -> CageResult<OwnedFd> {
+    if !path.is_absolute()
+        || path == Path::new("/")
+        || path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(CageError::policy(
+            path.display().to_string(),
+            format!("{label} source must be an absolute non-root path without traversal"),
+            "use the canonical source path produced by the preflight validator",
+        ));
+    }
+    let relative = path.strip_prefix("/").map_err(|_| {
+        CageError::policy(
+            path.display().to_string(),
+            format!("{label} source could not be made relative to the host root"),
+            "use a canonical absolute source path",
+        )
+    })?;
+    let root_fd = openat2(
+        CWD,
+        Path::new("/"),
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|error| {
+        CageError::SandboxSetup(format!(
+            "could not open the host root for {label} source {} with openat2: {error}; rule: mount sources must be resolved from a stable host-root descriptor; remedy: run on a Linux kernel with openat2 support",
+            path.display()
+        ))
+    })?;
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+    let fd = openat2(
+        &root_fd,
+        relative,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )
+    .map_err(|error| {
+        CageError::SandboxSetup(format!(
+            "could not open {label} source {} with openat2: {error}; rule: mount sources must be stable and symlink-free; remedy: remove the symlink or run on a Linux kernel with openat2 support",
+            path.display()
+        ))
+    })?;
+    let mut flags = fcntl_getfd(&fd).map_err(|error| {
+        CageError::SandboxSetup(format!(
+            "could not inspect the {label} file descriptor for {}: {error}; rule: mount descriptors must be transferable only to Bubblewrap; remedy: use a working Linux fcntl implementation",
+            path.display()
+        ))
+    })?;
+    flags.remove(FdFlags::CLOEXEC);
+    fcntl_setfd(&fd, flags).map_err(|error| {
+        CageError::SandboxSetup(format!(
+            "could not prepare the {label} file descriptor for {}: {error}; rule: Bubblewrap must receive the validated mount descriptor; remedy: use a working Linux fcntl implementation",
+            path.display()
+        ))
+    })?;
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
 enum MaskPath {
     Directory(PathBuf),
     File(PathBuf),
@@ -296,12 +610,10 @@ impl SandboxPlan {
                     "set CARGO_HOME to a real Cargo home directory",
                 ));
             }
+            validate_cargo_home_mount_location(cargo_home, &read_only_paths)?;
             let already_private = private_paths
                 .iter()
                 .any(|private| cargo_home == private || cargo_home.starts_with(private));
-            let would_be_reexposed_by_parent = read_only_paths
-                .iter()
-                .any(|visible| cargo_home == visible || cargo_home.starts_with(visible));
             let would_hide_runtime = runtime_mounts.iter().any(|mount| {
                 cargo_home.as_path() == mount.destination
                     || mount.destination.starts_with(cargo_home)
@@ -313,7 +625,7 @@ impl SandboxPlan {
                     "set CARGO_HOME below a dedicated directory outside /usr, /bin, /lib, and /etc",
                 ));
             }
-            if !already_private && !would_be_reexposed_by_parent {
+            if !already_private {
                 private_paths.push(cargo_home.clone());
             }
         }
@@ -352,6 +664,27 @@ impl SandboxPlan {
             network: request.policy.network,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cargo_home_mount_location(
+    cargo_home: &Path,
+    read_only_paths: &[PathBuf],
+) -> CageResult<()> {
+    if let Some(read_only) = read_only_paths
+        .iter()
+        .find(|read_only| paths_overlap(cargo_home, read_only))
+    {
+        return Err(CageError::policy(
+            cargo_home.display().to_string(),
+            format!(
+                "CARGO_HOME overlaps the read-only mount {}; mounting that workspace or toolchain path would re-expose Cargo caches",
+                read_only.display()
+            ),
+            "set CARGO_HOME outside all workspace, manifest, and toolchain mounts",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -531,17 +864,106 @@ fn push_mount_parent_directories(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Vec<OsString> {
+    let mounts = path_mount_arguments(plan);
+    build_bwrap_args_with_mounts(plan, &mounts, program, args)
+        .expect("test mount arguments include the internal launcher")
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+fn path_mount_arguments(plan: &SandboxPlan) -> MountArguments {
+    let runtime = plan
+        .runtime_mounts
+        .iter()
+        .map(|mount| MountArgument {
+            source: MountSource::Path(mount.source.clone()),
+            destination: mount.destination.clone(),
+            kind: MountKind::Directory,
+        })
+        .collect();
+    let read_only = plan
+        .read_only_paths
+        .iter()
+        .map(|path| MountArgument {
+            source: MountSource::Path(path.clone()),
+            destination: path.clone(),
+            kind: MountKind::Directory,
+        })
+        .collect();
+    let caches = plan
+        .cargo_cache_paths
+        .iter()
+        .map(|source| MountArgument {
+            source: MountSource::Path(source.clone()),
+            destination: Path::new(CARGO_HOME_IN_SANDBOX).join(
+                source
+                    .file_name()
+                    .expect("cache path has a final component"),
+            ),
+            kind: MountKind::Directory,
+        })
+        .collect();
+    let hidden_files = plan
+        .hidden_paths
+        .iter()
+        .filter_map(|mask| match mask {
+            MaskPath::Directory(_) => None,
+            MaskPath::File(path) => Some(MountArgument {
+                source: MountSource::Path(PathBuf::from("/dev/null")),
+                destination: path.clone(),
+                kind: MountKind::Special,
+            }),
+        })
+        .collect();
+    let writable = plan
+        .writable_paths
+        .iter()
+        .map(|path| MountArgument {
+            source: MountSource::Path(path.clone()),
+            destination: path.clone(),
+            kind: writable_mount_kind(path),
+        })
+        .collect();
+    MountArguments {
+        runtime,
+        read_only,
+        caches,
+        hidden_files,
+        writable,
+        launcher: Some(MountArgument {
+            source: MountSource::Path(PathBuf::from("/proc/self/exe")),
+            destination: PathBuf::from(crate::landlock::LAUNCHER_DESTINATION),
+            kind: MountKind::File,
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+fn writable_mount_kind(path: &Path) -> MountKind {
+    fs::symlink_metadata(path)
+        .map(|metadata| {
+            if metadata.is_dir() {
+                MountKind::Directory
+            } else {
+                MountKind::File
+            }
+        })
+        .unwrap_or(MountKind::Directory)
+}
+
+#[cfg(target_os = "linux")]
+fn build_bwrap_args_with_mounts(
+    plan: &SandboxPlan,
+    mounts: &MountArguments,
+    program: &Path,
+    args: &[OsString],
+) -> CageResult<Vec<OsString>> {
     let mut command = Vec::new();
-    for mount in &plan.runtime_mounts {
-        push_args(
-            &mut command,
-            [
-                OsString::from("--ro-bind"),
-                mount.source.clone().into_os_string(),
-                mount.destination.clone().into_os_string(),
-            ],
-        );
+    for mount in &mounts.runtime {
+        push_mount_argument(&mut command, true, mount);
     }
     push_args(&mut command, ["--proc", "/proc"]);
     push_args(&mut command, ["--dev", "/dev"]);
@@ -568,59 +990,29 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
         &plan.private_paths,
         &plan.runtime_mounts,
     );
-    for path in &plan.read_only_paths {
-        push_args(
-            &mut command,
-            [
-                OsString::from("--ro-bind"),
-                path.clone().into_os_string(),
-                path.clone().into_os_string(),
-            ],
-        );
+    for mount in &mounts.read_only {
+        push_mount_argument(&mut command, true, mount);
     }
 
-    for source in &plan.cargo_cache_paths {
-        let destination = Path::new(CARGO_HOME_IN_SANDBOX).join(
-            source
-                .file_name()
-                .expect("cache path has a final component"),
-        );
-        push_args(
-            &mut command,
-            [
-                OsString::from("--ro-bind"),
-                source.clone().into_os_string(),
-                destination.into_os_string(),
-            ],
-        );
+    for mount in &mounts.caches {
+        push_mount_argument(&mut command, true, mount);
     }
 
     for mask in &plan.hidden_paths {
-        match mask {
-            MaskPath::Directory(path) => push_args(
+        if let MaskPath::Directory(path) = mask {
+            push_args(
                 &mut command,
                 [OsString::from("--tmpfs"), path.clone().into_os_string()],
-            ),
-            MaskPath::File(path) => push_args(
-                &mut command,
-                [
-                    OsString::from("--ro-bind"),
-                    OsString::from("/dev/null"),
-                    path.clone().into_os_string(),
-                ],
-            ),
+            );
         }
     }
 
-    for path in &plan.writable_paths {
-        push_args(
-            &mut command,
-            [
-                OsString::from("--bind"),
-                path.clone().into_os_string(),
-                path.clone().into_os_string(),
-            ],
-        );
+    for mount in &mounts.hidden_files {
+        push_mount_argument(&mut command, true, mount);
+    }
+
+    for mount in &mounts.writable {
+        push_mount_argument(&mut command, false, mount);
     }
 
     if plan.network == NetworkAccess::Deny {
@@ -673,6 +1065,14 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
         );
     }
 
+    let launcher = mounts.launcher.as_ref().ok_or_else(|| {
+        CageError::SandboxSetup(
+            "the internal Landlock launcher mount was not prepared for path /run/cargo-cage-landlock-launcher; rule: Cargo must start only after the Landlock launcher is mounted; remedy: rebuild cargo-cage from a complete installation"
+                .to_owned(),
+        )
+    })?;
+    push_mount_argument(&mut command, true, launcher);
+
     command.push(OsString::from("--"));
     // dash (Ubuntu's /bin/sh) only accepts short file-descriptor numbers in
     // redirections. Bash handles the high descriptors Cargo's jobserver may
@@ -681,6 +1081,108 @@ fn build_bwrap_args(plan: &SandboxPlan, program: &Path, args: &[OsString]) -> Ve
     command.push(OsString::from("-c"));
     command.push(OsString::from(FD_SCRUBBER));
     command.push(OsString::from("cargo-cage-fd-scrubber"));
+    command.push(PathBuf::from(crate::landlock::LAUNCHER_DESTINATION).into_os_string());
+    command.push(OsString::from(crate::landlock::INTERNAL_LAUNCHER_ARG));
+    command.extend(landlock_launcher_args(plan, mounts, program, args));
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn push_mount_argument(command: &mut Vec<OsString>, read_only: bool, mount: &MountArgument) {
+    command.push(OsString::from(if read_only {
+        match &mount.source {
+            MountSource::Fd(_) => "--ro-bind-fd",
+            #[cfg(test)]
+            MountSource::Path(_) => "--ro-bind",
+        }
+    } else {
+        match &mount.source {
+            MountSource::Fd(_) => "--bind-fd",
+            #[cfg(test)]
+            MountSource::Path(_) => "--bind",
+        }
+    }));
+    match &mount.source {
+        MountSource::Fd(fd) => command.push(fd.to_string().into()),
+        #[cfg(test)]
+        MountSource::Path(path) => command.push(path.clone().into_os_string()),
+    }
+    command.push(mount.destination.clone().into_os_string());
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_launcher_args(
+    plan: &SandboxPlan,
+    mounts: &MountArguments,
+    program: &Path,
+    args: &[OsString],
+) -> Vec<OsString> {
+    let mut command = Vec::new();
+    for mount in &mounts.runtime {
+        push_args(
+            &mut command,
+            [
+                OsString::from("--landlock-execute"),
+                mount.destination.clone().into_os_string(),
+            ],
+        );
+    }
+    for mount in &mounts.read_only {
+        push_args(
+            &mut command,
+            [
+                OsString::from("--landlock-execute"),
+                mount.destination.clone().into_os_string(),
+            ],
+        );
+    }
+    for mount in &mounts.caches {
+        push_args(
+            &mut command,
+            [
+                OsString::from("--landlock-read"),
+                mount.destination.clone().into_os_string(),
+            ],
+        );
+    }
+    for mount in &mounts.writable {
+        let option = match mount.kind {
+            MountKind::Directory => "--landlock-write",
+            MountKind::File => "--landlock-lockfile",
+            MountKind::Special => unreachable!("special files cannot be writable mounts"),
+        };
+        push_args(
+            &mut command,
+            [
+                OsString::from(option),
+                mount.destination.clone().into_os_string(),
+            ],
+        );
+    }
+    for path in &plan.private_paths {
+        push_args(
+            &mut command,
+            [
+                OsString::from("--landlock-private"),
+                path.clone().into_os_string(),
+            ],
+        );
+    }
+    push_args(
+        &mut command,
+        [
+            OsString::from("--landlock-private"),
+            OsString::from(CARGO_HOME_IN_SANDBOX),
+            OsString::from("--landlock-proc"),
+            OsString::from("/proc"),
+            OsString::from("--landlock-device"),
+            OsString::from("/dev"),
+        ],
+    );
+    if plan.network == NetworkAccess::Deny {
+        command.push(OsString::from("--landlock-network-deny"));
+    }
+    command.push(OsString::from("--"));
     command.push(program.to_path_buf().into_os_string());
     command.extend(args.iter().cloned());
     command
@@ -1407,6 +1909,63 @@ fn paths_overlap(first: &Path, second: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn current_executable() -> CageResult<PathBuf> {
+    let executable = env::current_exe().map_err(|error| {
+        CageError::io("could not determine the cargo-cage executable path", error)
+    })?;
+    validate_launcher_executable(executable)
+}
+
+#[cfg(target_os = "linux")]
+fn default_launcher() -> CageResult<PathBuf> {
+    let executable = current_executable()?;
+    if executable.file_name() == Some(std::ffi::OsStr::new("cargo-cage")) {
+        return Ok(executable);
+    }
+    let sibling = executable
+        .parent()
+        .map(|parent| parent.join("cargo-cage-landlock-launcher"));
+    if let Some(sibling) = sibling {
+        if sibling.exists() {
+            return validate_launcher_executable(sibling);
+        }
+    }
+    Err(CageError::BackendUnavailable(
+        "the current program is not cargo-cage and no cargo-cage-landlock-launcher was found beside it; call LinuxSandbox::with_launcher with the installed launcher path"
+            .to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_launcher_executable(path: PathBuf) -> CageResult<PathBuf> {
+    let canonical = canonical_path_without_symlink(&path, "Landlock launcher executable")?;
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        CageError::io(
+            format!(
+                "could not inspect Landlock launcher executable {}",
+                canonical.display()
+            ),
+            error,
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(CageError::policy(
+            canonical.display().to_string(),
+            "the Landlock launcher must be a regular file",
+            "install the cargo-cage-landlock-launcher binary or pass a real launcher path",
+        ));
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(CageError::policy(
+            canonical.display().to_string(),
+            "the Landlock launcher must be executable",
+            "restore executable permissions on cargo-cage-landlock-launcher",
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
 fn is_reexposed_below_private(
     path: &Path,
     private_path: &Path,
@@ -1737,6 +2296,122 @@ mod tests {
     }
 
     #[test]
+    fn production_builder_uses_fd_mounts_and_landlock_launcher() {
+        let plan = SandboxPlan {
+            current_dir: PathBuf::from("/workspace"),
+            runtime_mounts: vec![BindMount {
+                source: PathBuf::from("/usr"),
+                destination: PathBuf::from("/usr"),
+            }],
+            writable_paths: vec![PathBuf::from("/workspace/target")],
+            hidden_paths: Vec::new(),
+            private_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/run")],
+            read_only_paths: vec![PathBuf::from("/workspace")],
+            cargo_cache_paths: Vec::new(),
+            environment: Environment::clean(),
+            network: NetworkAccess::Deny,
+        };
+        let mounts = MountArguments {
+            runtime: vec![MountArgument {
+                source: MountSource::Fd(101),
+                destination: PathBuf::from("/usr"),
+                kind: MountKind::Directory,
+            }],
+            read_only: vec![MountArgument {
+                source: MountSource::Fd(102),
+                destination: PathBuf::from("/workspace"),
+                kind: MountKind::Directory,
+            }],
+            caches: Vec::new(),
+            hidden_files: Vec::new(),
+            writable: vec![MountArgument {
+                source: MountSource::Fd(103),
+                destination: PathBuf::from("/workspace/target"),
+                kind: MountKind::Directory,
+            }],
+            launcher: Some(MountArgument {
+                source: MountSource::Fd(104),
+                destination: PathBuf::from(crate::landlock::LAUNCHER_DESTINATION),
+                kind: MountKind::File,
+            }),
+        };
+
+        let args = build_bwrap_args_with_mounts(
+            &plan,
+            &mounts,
+            Path::new("/usr/bin/cargo"),
+            &[OsString::from("build")],
+        )
+        .expect("fd mount arguments");
+
+        assert!(contains_pair(&args, "--ro-bind-fd", "101", "/usr"));
+        assert!(contains_pair(&args, "--ro-bind-fd", "102", "/workspace"));
+        assert!(contains_pair(
+            &args,
+            "--bind-fd",
+            "103",
+            "/workspace/target"
+        ));
+        assert!(contains_pair(
+            &args,
+            "--ro-bind-fd",
+            "104",
+            crate::landlock::LAUNCHER_DESTINATION
+        ));
+        assert!(
+            args.iter()
+                .any(|arg| arg == crate::landlock::INTERNAL_LAUNCHER_ARG)
+        );
+        assert!(args.iter().any(|arg| arg == "--landlock-network-deny"));
+        assert!(!args.iter().any(|arg| arg == "--ro-bind"));
+        assert!(!args.iter().any(|arg| arg == "--bind"));
+    }
+
+    #[test]
+    fn opened_mount_sources_are_rooted_and_type_checked() {
+        if !Path::new("/usr").is_dir() || !Path::new("/dev/null").exists() {
+            return;
+        }
+        let directory =
+            open_mount_source(Path::new("/usr"), "test runtime").expect("open runtime directory");
+        validate_opened_mount_kind(
+            &directory,
+            MountKind::Directory,
+            Path::new("/usr"),
+            "test runtime",
+        )
+        .expect("runtime directory type");
+        let device =
+            open_mount_source(Path::new("/dev/null"), "test mask").expect("open null device");
+        validate_opened_mount_kind(
+            &device,
+            MountKind::Special,
+            Path::new("/dev/null"),
+            "test mask",
+        )
+        .expect("null device type");
+        assert!(
+            !fcntl_getfd(&directory)
+                .expect("directory descriptor flags")
+                .contains(FdFlags::CLOEXEC)
+        );
+        assert!(
+            !fcntl_getfd(&device)
+                .expect("device descriptor flags")
+                .contains(FdFlags::CLOEXEC)
+        );
+    }
+
+    #[test]
+    fn opened_mount_sources_reject_root_and_traversal() {
+        let root = open_mount_source(Path::new("/"), "test root").expect_err("root source");
+        assert!(root.to_string().contains("non-root"));
+        let traversal =
+            open_mount_source(Path::new("/usr/../etc"), "test traversal").expect_err("traversal");
+        assert!(traversal.to_string().contains("traversal"));
+    }
+
+    #[test]
     fn clean_environment_is_explicitly_applied_to_bubblewrap() {
         let plan = SandboxPlan {
             current_dir: PathBuf::from("/workspace"),
@@ -1961,6 +2636,25 @@ mod tests {
 
         validate_cache_source_policy(Path::new("/tmp/workspace/cargo-home/registry"), &[], &[])
             .expect("cache below explicitly re-exposed workspace");
+    }
+
+    #[test]
+    fn rejects_cargo_home_reexposed_by_a_read_only_mount() {
+        let error = validate_cargo_home_mount_location(
+            Path::new("/workspace/.cargo-home"),
+            &[PathBuf::from("/workspace")],
+        )
+        .expect_err("Cargo home below the workspace");
+        let text = error.to_string();
+        assert!(text.contains("CARGO_HOME"), "{text}");
+        assert!(text.contains("re-expose"), "{text}");
+        assert!(text.contains("remedy:"), "{text}");
+
+        validate_cargo_home_mount_location(
+            Path::new("/home/user/.cargo"),
+            &[PathBuf::from("/home/user/workspace")],
+        )
+        .expect("a sibling Cargo home does not overlap the workspace");
     }
 
     #[test]

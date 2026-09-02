@@ -53,8 +53,15 @@ the parent-death guard. If setup cannot be proved, the operation stops.
 
 The sandbox exposes a small read-only Linux runtime plus the selected
 workspace, toolchain, and Cargo cache paths. The host root is not mounted as a
-single tree. The canonical workspace `target` directory and `Cargo.lock` are
-the persistent writable locations. `/tmp`, `/var/tmp`, and `/run` are private.
+single tree. Each command gets a fresh writable target run below
+target/.cargo-cage/runs/; Cargo.lock is the only other persistent writable
+file. /tmp, /var/tmp, and /run are private.
+
+Host path sources are opened through fd-based, symlink-resistant resolution
+and passed to Bubblewrap with fd bind options. Once Bubblewrap has finished its
+mount setup, an internal Rust launcher applies a deny-by-default Landlock
+ruleset before starting Cargo. The required filesystem baseline is Landlock
+ABI 5. Newer Unix-socket and scope restrictions are used when available.
 
 Cargo runs with `CARGO_NET_OFFLINE=true`, a private `CARGO_HOME`, and a clean
 environment populated from a fixed allowlist. Existing `registry` and `git`
@@ -90,6 +97,8 @@ canonical invocation.
   `Cargo.lock`.
 - Straightforward symlink, traversal, special-file, nested-mount, and external
   hardlink escapes in paths that are about to be mounted.
+- A path source changing between validation and Bubblewrap setup in the common
+  fd-bind case.
 - A missing, old, or broken Bubblewrap backend silently turning into a normal
   host build.
 - Extra inherited file descriptors crossing into the build.
@@ -102,23 +111,34 @@ canonical invocation.
 - Side channels or complete secrecy of every host file and environment value.
 - Secrets deliberately placed in readable project files, compiler flags, or
   selected runtime/toolchain paths.
-- Files a build writes inside `target`; those artifacts are not trusted.
+- Files a build writes inside an isolated target run; those artifacts are not
+  trusted or copied into the normal target tree.
+- The explicit --reuse-target mode, which is only intended for trusted
+  workspaces and restores persistent incremental-artifact risk.
+- Every filesystem operation that Landlock does not cover, including some
+  actions involving already-open file descriptors.
 - A race-free filesystem guarantee against another local process changing the
   path hierarchy during setup.
 - A `cargo cage` alias bypass. Cargo expands aliases before external
   subcommands, so a workspace can prevent `cargo-cage` from being started at
   all. Use the direct executable. See
   [Cargo issue #10049](https://github.com/rust-lang/cargo/issues/10049).
-- Seccomp, Landlock, resource limits, a GUI, macOS/Windows support, dependency
+- Seccomp, resource limits, a GUI, macOS/Windows support, dependency
   reputation, or AI-based detection.
 
 ## Residual risk
 
-The path checks use safe Rust and the standard library and are intentionally
-conservative. They reduce accidental and straightforward filesystem escapes,
-but they do not make path validation atomic against a concurrent local
-attacker. The project must not claim complete confidentiality or complete
-sandbox escape prevention.
+The path checks use safe Rust and the standard library, while host mount
+sources use safe wrappers around fd-based Linux APIs. They reduce accidental
+and straightforward filesystem escapes, but they do not make every operation
+atomic against a concurrent local attacker. The project must not claim
+complete confidentiality or complete sandbox escape prevention.
+
+The independent Rust red-team runner in security/redteam is intentionally
+separate from the normal regression tests. It tries black-box writes, reads,
+sockets, process and namespace operations, target poisoning, and concurrent
+path swaps. A green run is useful evidence, not a proof against a kernel or
+sandbox vulnerability.
 
 The dispatcher issue is worth spelling out: if the user runs `cargo cage
 build` and Cargo expands a repository or user alias named `cage`, `cargo-cage`

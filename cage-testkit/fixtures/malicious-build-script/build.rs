@@ -174,7 +174,8 @@ fn symlink_escape() -> ! {
 
 fn runtime_hardlink_escape() -> ! {
     let source = manifest_path("Cargo.toml");
-    let alias = manifest_path("target/runtime-hardlink-escape");
+    let target_dir = PathBuf::from(env::var_os("CARGO_TARGET_DIR").expect("CARGO_TARGET_DIR is set"));
+    let alias = target_dir.join("runtime-hardlink-escape");
     match fs::hard_link(&source, &alias) {
         Ok(()) => match fs::write(&alias, b"runtime hardlink escape") {
             Ok(()) => panic!(
@@ -217,8 +218,9 @@ fn inherited_fd_read() -> ! {
 }
 
 fn parent_death_probe() {
-    let started = manifest_path("target/parent-death-started");
-    let finished = manifest_path("target/parent-death-finished");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+    let started = output_dir.join("parent-death-started");
+    let finished = output_dir.join("parent-death-finished");
     fs::write(&started, b"started").expect("parent-death start marker is writable");
     let child = Command::new("sh")
         .arg("-c")

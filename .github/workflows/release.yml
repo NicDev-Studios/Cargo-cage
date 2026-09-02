@@ -110,6 +110,7 @@ jobs:
           cargo new --quiet --bin "$smoke_dir/smoke-project"
           cd "$smoke_dir/smoke-project"
           cargo-cage --help >/dev/null
+          cargo-cage doctor
           cargo-cage build
 
   github-draft:

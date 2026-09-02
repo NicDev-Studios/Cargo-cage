@@ -15,6 +15,10 @@ inputs:
     description: Exact cargo-cage version to install from crates.io.
     required: false
     default: 0.1.0-alpha.1
+  install-from-source:
+    description: Install cargo-cage from the checked-out action source (for action development).
+    required: false
+    default: 'false'
 
 branding:
   icon: shield
@@ -36,13 +40,21 @@ runs:
       shell: bash
       run: bash "${{ github.action_path }}/.github/scripts/install-bubblewrap.sh"
 
-    - name: Install cargo-cage
+    - name: Install cargo-cage from crates.io
+      if: inputs.install-from-source != 'true'
       shell: bash
       env:
         CARGO_CAGE_VERSION: ${{ inputs.cargo-cage-version }}
       run: |
         set -euo pipefail
         cargo install cargo-cage --locked --version "${CARGO_CAGE_VERSION}"
+
+    - name: Install cargo-cage from action source
+      if: inputs.install-from-source == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo install --path "${{ github.action_path }}/cargo-cage" --locked
 
     - name: Check sandbox
       shell: bash

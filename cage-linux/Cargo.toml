@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 readme.workspace = true
-description = "Linux Bubblewrap backend for cargo-cage."
+description = "Linux Bubblewrap and Landlock backend for cargo-cage."
 keywords = ["linux", "sandbox", "security", "bubblewrap"]
 categories = ["os", "development-tools"]
 publish = true
@@ -21,3 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 cage-core = { package = "cargo-cage-core", path = "../cage-core", version = "0.1.0-alpha.1" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }

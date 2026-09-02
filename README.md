@@ -20,9 +20,15 @@ dedicated build service, or a careful review of the code you build.
 - Blocks the network by default and forces Cargo into offline mode.
 - Starts with a small read-only Linux runtime instead of mounting the host
   root wholesale.
-- Keeps the workspace readable, but allows persistent writes only to the
-  canonical `target` directory and `Cargo.lock`.
-- Keeps Cargo's normal output and `OUT_DIR` working under `target`.
+- Keeps the workspace readable, but gives each command a fresh writable target
+  run below target/.cargo-cage/runs/. Cargo.lock is still a separate
+  persistent writable file.
+- Keeps Cargo's normal output and OUT_DIR working inside that isolated run.
+- Uses Bubblewrap fd-based mounts and Linux openat2 path resolution for host
+  mount sources. If those checks cannot be completed, the build stops.
+- Adds a deny-by-default Landlock layer after Bubblewrap setup. Landlock ABI 5
+  is required; newer filesystem and scope restrictions are enabled when
+  supported by the kernel.
 - Gives `/tmp`, `/var/tmp`, and `/run` private throwaway filesystems.
 - Starts Cargo with an empty environment and a reviewed Cargo/Rust/locale
   allowlist. Host secrets, credentials, agent sockets, `HOME`, and arbitrary
@@ -46,17 +52,20 @@ dedicated build service, or a careful review of the code you build.
 The same policy is used for `build`, `check`, `test`, and `doc`. `doctor`
 checks the setup without creating or changing project files.
 
-This is the first public alpha, `0.1.0-alpha.1`. It is deliberately rough
-around the edges and should not be mistaken for a production-grade sandbox.
+This is still the first public alpha, 0.1.0-alpha.1. The Alpha 2 hardening
+work is being developed without changing the version until Ubuntu CI is green.
+It is deliberately rough around the edges and should not be mistaken for a
+production-grade sandbox.
 
 ## Requirements and installation
 
 The reference setup is Ubuntu 24.04 x86_64 with unprivileged user namespaces
 enabled, a host security policy that permits Bubblewrap, and Bubblewrap
-`0.12.0` or newer. Other Linux distributions may work; they are not the
-reference platform. macOS and Windows are not supported. The Linux runtime
-also needs Bash at `/bin/bash`; cargo-cage uses it only for the small
-file-descriptor scrubber and stops if it is missing.
+0.12.0 or newer. The kernel must also provide Landlock ABI 5 and openat2.
+Other Linux distributions may work; they are not the reference platform.
+macOS and Windows are not supported. The Linux runtime also needs Bash at
+/bin/bash; cargo-cage uses it only for the small file-descriptor scrubber and
+stops if it is missing.
 
 ```sh
 sudo apt-get install bubblewrap
@@ -117,6 +126,10 @@ explicitly when using another published version. For a supply-chain-sensitive
 workflow, pin the Action itself to a full commit SHA instead of the moving
 `v1` tag.
 
+Action development can use `install-from-source: true` to exercise the
+checked-out CLI instead of the published package. That input is for this
+repository's own smoke test, not a shortcut around the normal release process.
+
 The action does not fetch project dependencies automatically. `cargo fetch`
 stays an explicit step outside the cage. It currently supports Linux runners
 with an Ubuntu/Debian-style package manager; Ubuntu 24.04 is the reference
@@ -152,7 +165,24 @@ Cargo arguments keep their normal Cargo meaning. `--workspace`, `--package`,
 `--features`, `--release`, `--target`, `--manifest-path`, and `--target-dir`
 work as normal, subject to the path policy. Relative manifest and target paths
 are resolved safely when the sandbox needs a narrower working directory. A
-target directory must resolve inside the canonical workspace.
+target directory must resolve inside the canonical workspace. A fresh run is
+used by default:
+
+~~~sh
+cargo-cage build
+~~~
+
+Artifacts are retained below target/.cargo-cage/runs/ and are intentionally
+treated as untrusted. Reusing the existing target tree is an explicit escape
+hatch for trusted workspaces:
+
+~~~sh
+cargo-cage --reuse-target build
+~~~
+
+That mode restores Cargo's usual target path and its incremental cache, but
+also restores the cross-build artifact trust problem. It is not the safe
+default.
 
 ### Why not rely on `cargo cage`?
 
@@ -194,6 +224,10 @@ cargo-cage build --features workspace-write || true
 test ! -e build-script-write.txt
 ```
 
+For a separate adversarial pass, the repository contains a Rust-only
+black-box runner in security/redteam. It generates its own fixtures and checks
+that external sentinel files remain unchanged.
+
 ## Failure behaviour
 
 Policy and setup failures stop the operation before the real Cargo process is
@@ -217,9 +251,12 @@ fail-closed, but they are not atomic against another local process changing
 the filesystem during setup. Files written under `target` are not trusted
 automatically, and generated binaries are not made safe to execute.
 
-There is no Seccomp or Landlock policy, no resource limit, no GUI, no dependency
-reputation system, no AI detection, and no macOS/Windows backend here. Those
-are separate problems, not decorations for this release.
+There is no Seccomp or resource limit, no GUI, no dependency reputation
+system, no AI detection, and no macOS/Windows backend here. Landlock itself
+does not restrict every operation (for example, some actions involving
+already-open file descriptors), and the path setup is not a complete
+concurrent-filesystem race proof. Those are separate limits, not decorations
+we pretend to have solved.
 
 Read [THREAT_MODEL.md](THREAT_MODEL.md) and [SECURITY.md](SECURITY.md) before
 using this for anything important.

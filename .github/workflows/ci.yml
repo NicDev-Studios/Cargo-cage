@@ -30,6 +30,8 @@ jobs:
           fi
       - name: Install sandbox runtime
         run: bash .github/scripts/install-bubblewrap.sh
+      - name: Install red-team tools
+        run: sudo apt-get install --yes python3 util-linux
       - name: Check sandbox runtime
         run: |
           bwrap --version
@@ -41,7 +43,7 @@ jobs:
             require "yaml"
             action = YAML.load_file("action.yml")
             abort "action.yml must declare a composite action" unless action.dig("runs", "using") == "composite"
-            %w[command args cargo-cage-version].each do |name|
+            %w[command args cargo-cage-version install-from-source].each do |name|
               abort "action.yml is missing input #{name}" unless action.dig("inputs", name)
             end
             puts "action.yml: valid composite action metadata"
@@ -56,9 +58,21 @@ jobs:
         run: timeout --signal=TERM --kill-after=15s 5m cargo test --workspace -- --nocapture
       - name: Run doctor smoke check
         run: cargo run --quiet --package cargo-cage -- doctor
+      - name: Check independent red-team runner
+        run: cargo fmt --manifest-path security/redteam/Cargo.toml -- --check
+      - name: Run independent red-team runner
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path security/redteam/Cargo.toml --all-targets --locked -- -D warnings
+          cargo build --package cargo-cage --locked
+          timeout --signal=TERM --kill-after=15s 10m \
+            cargo run --manifest-path security/redteam/Cargo.toml --locked -- \
+            --cargo-cage "$PWD/target/debug/cargo-cage" \
+            --iterations 64
       - name: Exercise local composite action
         uses: ./
         with:
+          install-from-source: true
           cargo-cage-version: 0.1.0-alpha.1
           command: build
           args: --locked --workspace
