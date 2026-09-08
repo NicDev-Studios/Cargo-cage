@@ -38,6 +38,7 @@ jobs:
           set -euo pipefail
           root=/sys/fs/cgroup
           group="$root/cargo-cage-ci"
+          leaf="$group/runner"
           if sudo test -e "$group"; then
             echo "::error::delegated cgroup path already exists: $group"
             exit 1
@@ -54,8 +55,12 @@ jobs:
           sudo grep -qw memory "$root/cgroup.subtree_control"
           sudo grep -qw pids "$root/cgroup.subtree_control"
           sudo sh -c "printf '+cpu +memory +pids\\n' > '$group/cgroup.subtree_control'"
-          sudo chown "$USER":"$USER" "$group" "$group/cgroup.procs" "$group/cgroup.subtree_control"
-          sudo sh -c "printf '%s\\n' '$PPID' > '$group/cgroup.procs'"
+          sudo mkdir "$leaf"
+          # A cgroup with delegated domain controllers cannot contain
+          # processes itself. Keep the runner in a leaf and let cargo-cage
+          # create its short-lived resource cgroups next to that leaf.
+          sudo chown "$USER":"$USER" "$group" "$group/cgroup.procs" "$leaf" "$leaf/cgroup.procs"
+          sudo sh -c "printf '%s\\n' '$PPID' > '$leaf/cgroup.procs'"
       - name: Check sandbox runtime
         run: |
           bwrap --version
@@ -92,8 +97,10 @@ jobs:
           set -euo pipefail
           root=/sys/fs/cgroup
           group="$root/cargo-cage-ci"
+          leaf="$group/runner"
           if [[ -d "$group" ]]; then
             sudo sh -c "printf '%s\\n' '$BASHPID' > '$root/cgroup.procs'; printf '%s\\n' '$PPID' > '$root/cgroup.procs'"
             sudo sh -c "printf '1\\n' > '$group/cgroup.kill'"
+            sudo rmdir "$leaf"
             sudo rmdir "$group"
           fi

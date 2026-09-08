@@ -92,7 +92,7 @@ impl ResourceReport {
 }
 
 pub(super) struct ResourceGroup {
-    parent: PathBuf,
+    restore: PathBuf,
     path: PathBuf,
     limits: EffectiveResourceLimits,
     before: EventCounters,
@@ -123,7 +123,7 @@ impl ResourceGroup {
         };
 
         Ok(Self {
-            parent: context.parent,
+            restore: context.restore,
             path,
             limits: context.limits,
             before,
@@ -159,7 +159,7 @@ impl ResourceGroup {
 
     pub(super) fn restore_current_process(&mut self) -> CageResult<()> {
         write_pid(
-            &self.parent.join("cgroup.procs"),
+            &self.restore.join("cgroup.procs"),
             "restore the cargo-cage supervisor",
         )?;
         self.entered = false;
@@ -233,7 +233,7 @@ impl Drop for ResourceGroup {
         let mut supervisor_restored = true;
         if self.entered {
             supervisor_restored =
-                write_pid(&self.parent.join("cgroup.procs"), "restore the supervisor").is_ok();
+                write_pid(&self.restore.join("cgroup.procs"), "restore the supervisor").is_ok();
             if supervisor_restored {
                 self.entered = false;
             }
@@ -248,6 +248,7 @@ impl Drop for ResourceGroup {
 #[derive(Debug)]
 struct CgroupContext {
     parent: PathBuf,
+    restore: PathBuf,
     limits: EffectiveResourceLimits,
 }
 
@@ -269,14 +270,12 @@ impl CgroupContext {
         } else {
             mount.join(relative.strip_prefix("/").unwrap_or(&relative))
         };
-        let parent = canonical_directory_without_symlinks(&parent, "current cgroup")?;
-        require_controller(&parent, "cpu")?;
-        require_controller(&parent, "memory")?;
-        require_controller(&parent, "pids")?;
+        let restore = canonical_directory_without_symlinks(&parent, "current cgroup")?;
         require_writable(
-            &parent.join("cgroup.procs"),
-            "current cgroup process migration",
+            &restore.join("cgroup.procs"),
+            "restoring the cargo-cage supervisor",
         )?;
+        let parent = find_delegated_parent(&mount, &restore)?;
 
         let host_memory = host_memory_bytes()?;
         let host_budget = host_memory
@@ -309,6 +308,7 @@ impl CgroupContext {
 
         Ok(Self {
             parent,
+            restore,
             limits: EffectiveResourceLimits {
                 max_processes: requested.max_processes,
                 max_memory_bytes,
@@ -318,6 +318,56 @@ impl CgroupContext {
                 max_open_files: requested.max_open_files,
             },
         })
+    }
+}
+
+fn find_delegated_parent(mount: &Path, restore: &Path) -> CageResult<PathBuf> {
+    let mut candidate = restore.to_path_buf();
+    loop {
+        if has_required_controllers(&candidate)? && can_create_child(&candidate)? {
+            return Ok(candidate);
+        }
+        if candidate == mount {
+            break;
+        }
+        if !candidate.pop() {
+            break;
+        }
+    }
+
+    Err(cgroup_setup_error(
+        restore.display().to_string(),
+        "an ancestor cgroup must delegate cpu, memory, and pids to a private child",
+        "run inside a user-delegated cgroup subtree with those controllers enabled on its parent",
+        format!(
+            "no usable delegated ancestor was found between {} and {}",
+            restore.display(),
+            mount.display()
+        ),
+    ))
+}
+
+fn has_required_controllers(path: &Path) -> CageResult<bool> {
+    let available = read_text(&path.join("cgroup.controllers"))?;
+    let enabled = read_text(&path.join("cgroup.subtree_control"))?;
+    Ok(["cpu", "memory", "pids"]
+        .into_iter()
+        .all(|controller| has_word(&available, controller) && has_word(&enabled, controller)))
+}
+
+fn can_create_child(path: &Path) -> CageResult<bool> {
+    match OpenOptions::new()
+        .write(true)
+        .open(path.join("cgroup.procs"))
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+        Err(error) => Err(cgroup_setup_error(
+            path.display().to_string(),
+            "the delegated ancestor cgroup process file must be writable",
+            "delegate cgroup.procs and child creation to the current user",
+            error.to_string(),
+        )),
     }
 }
 
@@ -479,20 +529,6 @@ fn write_control(path: &Path, name: &str, value: String) -> CageResult<()> {
             error.to_string(),
         )
     })
-}
-
-fn require_controller(parent: &Path, controller: &str) -> CageResult<()> {
-    let available = read_text(&parent.join("cgroup.controllers"))?;
-    let enabled = read_text(&parent.join("cgroup.subtree_control"))?;
-    if !has_word(&available, controller) || !has_word(&enabled, controller) {
-        return Err(cgroup_setup_error(
-            parent.display().to_string(),
-            format!("the {controller} cgroup controller must be delegated to child cgroups"),
-            "enable cpu, memory, and pids in the user-owned cgroup v2 subtree",
-            format!("available={available:?}, enabled={enabled:?}"),
-        ));
-    }
-    Ok(())
 }
 
 fn require_writable(path: &Path, subject: &str) -> CageResult<()> {
