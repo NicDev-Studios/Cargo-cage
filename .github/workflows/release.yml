@@ -139,11 +139,20 @@ jobs:
           set -euo pipefail
           root=/sys/fs/cgroup
           group="$root/cargo-cage-release"
-          leaf="$group/runner"
           if [[ -d "$group" ]]; then
             sudo sh -c "printf '%s\\n' '$BASHPID' > '$root/cgroup.procs'; printf '%s\\n' '$PPID' > '$root/cgroup.procs'"
             sudo sh -c "printf '1\\n' > '$group/cgroup.kill'"
-            sudo rmdir "$leaf"
+            mapfile -t children < <(sudo find "$group" -mindepth 1 -type d -depth -print)
+            for child in "${children[@]}"; do
+              sudo sh -c "printf '1\\n' > '$child/cgroup.kill'"
+              sudo rmdir "$child"
+            done
+            remaining="$(sudo cat "$group/cgroup.procs")"
+            if [[ -n "$remaining" ]]; then
+              echo "::error::delegated cgroup still contains processes: $remaining"
+              exit 1
+            fi
+            sudo sh -c "printf '%s\\n' '-cpu -memory -pids' > '$group/cgroup.subtree_control'"
             sudo rmdir "$group"
           fi
 
@@ -221,11 +230,20 @@ jobs:
           set -euo pipefail
           root=/sys/fs/cgroup
           group="$root/cargo-cage-install"
-          leaf="$group/runner"
           if [[ -d "$group" ]]; then
             sudo sh -c "printf '%s\\n' '$BASHPID' > '$root/cgroup.procs'; printf '%s\\n' '$PPID' > '$root/cgroup.procs'"
             sudo sh -c "printf '1\\n' > '$group/cgroup.kill'"
-            sudo rmdir "$leaf"
+            mapfile -t children < <(sudo find "$group" -mindepth 1 -type d -depth -print)
+            for child in "${children[@]}"; do
+              sudo sh -c "printf '1\\n' > '$child/cgroup.kill'"
+              sudo rmdir "$child"
+            done
+            remaining="$(sudo cat "$group/cgroup.procs")"
+            if [[ -n "$remaining" ]]; then
+              echo "::error::delegated cgroup still contains processes: $remaining"
+              exit 1
+            fi
+            sudo sh -c "printf '%s\\n' '-cpu -memory -pids' > '$group/cgroup.subtree_control'"
             sudo rmdir "$group"
           fi
 
