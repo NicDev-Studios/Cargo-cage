@@ -29,6 +29,12 @@ dedicated build service, or a careful review of the code you build.
 - Adds a deny-by-default Landlock layer after Bubblewrap setup. Landlock ABI 5
   is required; newer filesystem and scope restrictions are enabled when
   supported by the kernel.
+- Places Bubblewrap and every build descendant in a delegated cgroup-v2
+  resource boundary: 512 processes, an 8 GiB memory ceiling clamped to 75% of
+  available host memory and the parent cgroup, four CPU cores, a 30-minute
+  wall-clock budget, file-size and descriptor limits, and no swap. An effective
+  memory budget below 1 GiB is rejected. If that boundary cannot be activated,
+  the build stops. There is no CLI switch to disable or raise it.
 - Gives `/tmp`, `/var/tmp`, and `/run` private throwaway filesystems.
 - Starts Cargo with an empty environment and a reviewed Cargo/Rust/locale
   allowlist. Host secrets, credentials, agent sockets, `HOME`, and arbitrary
@@ -58,8 +64,9 @@ the edges and should not be mistaken for a production-grade sandbox.
 ## Requirements and installation
 
 The reference setup is Ubuntu 24.04 x86_64 with unprivileged user namespaces
-enabled, a host security policy that permits Bubblewrap, and Bubblewrap
-0.12.0 or newer. The kernel must also provide Landlock ABI 5 and openat2.
+enabled, a host security policy that permits Bubblewrap, Bubblewrap 0.12.0 or
+newer, and a user-delegated cgroup-v2 subtree with `cpu`, `memory`, and `pids`
+controllers. The kernel must also provide Landlock ABI 5 and openat2.
 Other Linux distributions may work; they are not the reference platform.
 macOS and Windows are not supported. The Linux runtime also needs Bash at
 /bin/bash; cargo-cage uses it only for the small file-descriptor scrubber and
@@ -74,6 +81,12 @@ cargo install --path cargo-cage --locked
 If your distribution ships an older Bubblewrap, install its security update or
 a checksum-verified newer build. `cargo-cage` stops instead of running Cargo
 unsandboxed.
+
+The cgroup delegation is a host/CI setup concern; cargo-cage does not ask for
+root, change the host hierarchy, or silently fall back when delegation is
+missing. `doctor` creates only a temporary child below the already delegated
+user subtree and removes it again. On a managed machine, configure that
+delegation through the host's service manager and then run `cargo-cage doctor`.
 
 Once the alpha is published, install it from crates.io with:
 
@@ -294,9 +307,10 @@ hang the whole CI job forever.
 
 This project draws a boundary around a build; it does not make the build
 trustworthy. It does not protect against kernel, Bubblewrap, Cargo, Rustc, or
-toolchain vulnerabilities. It does not solve resource exhaustion, fork
-bombs, side channels, or every secret that might exist in a readable project,
-runtime directory, compiler flag, or environment value.
+toolchain vulnerabilities. Its fixed resource budget reduces process, memory,
+file-size, descriptor, and wall-clock abuse, but it does not solve disk-space
+exhaustion, side channels, or every secret that might exist in a readable
+project, runtime directory, compiler flag, or environment value.
 
 The path checks use safe Rust and the standard library. They are deliberately
 fail-closed, but they are not atomic against another local process changing
@@ -308,8 +322,10 @@ created by the Bubblewrap setup and rejects filesystem-root policy paths, so an
 installed launcher binary cannot accidentally be used as a general-purpose
 policy override. It is not a replacement for the outer Bubblewrap boundary.
 
-There is no Seccomp or resource limit, no GUI, no dependency reputation
-system, no AI detection, and no macOS/Windows backend here. Landlock itself
+There is no Seccomp or disk-space quota, no GUI, no dependency reputation
+system, no AI detection, and no macOS/Windows backend here. The fixed resource
+limits reduce runaway processes and memory/time abuse, but they do not make a
+build harmless or prevent all denial of service. Landlock itself
 does not restrict every operation (for example, some actions involving
 already-open file descriptors), and the path setup is not a complete
 concurrent-filesystem race proof. Those are separate limits, not decorations

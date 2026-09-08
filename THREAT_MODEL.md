@@ -35,8 +35,9 @@ The main things we are trying not to hand to a build script are:
 
 ## Trusted components
 
-The Linux kernel, the host security policy, Bubblewrap `0.12.0+`, Cargo, Rustc,
-and the user's selected toolchain are trusted for this release. If one of
+The Linux kernel, its cgroup-v2 delegation, the host security policy, Bubblewrap
+`0.12.0+`, Cargo, Rustc, and the user's selected toolchain are trusted for this
+release. If one of
 those has a vulnerability or is configured to behave maliciously, this tool
 cannot repair it.
 
@@ -71,6 +72,13 @@ Cargo config remains visible because it is project input, not host trust.
 Standard stdio remains connected; extra inherited file descriptors are scrubbed
 before the build process is exec'd by the fixed `/bin/bash` scrubber. A missing
 Bash runtime is a setup error, not a fallback condition.
+
+Before Bubblewrap is spawned, the cargo-cage supervisor enters a private
+delegated cgroup-v2 child, starts Bubblewrap from that cgroup, and then moves
+itself back. This makes all build descendants inherit the resource boundary
+without a post-spawn migration race. Process count, memory, CPU, wall-clock,
+file-size, open-descriptor, swap, and core-dump limits are applied before the
+untrusted process starts. The cgroup is killed and removed after every run.
 
 Workspace, cache, target, lockfile, hidden, and toolchain paths are checked
 before mounting. Traversal, unsafe symlink resolution, special files, nested
@@ -108,12 +116,13 @@ security boundary.
 - A missing, old, or broken Bubblewrap backend silently turning into a normal
   host build.
 - Extra inherited file descriptors crossing into the build.
+- Fork bombs, memory exhaustion, runaway children, and long-running builds up
+  to the configured resource budget.
 
 ## What this does not protect against
 
 - Kernel, Bubblewrap, Cargo, Rustc, toolchain, or host-policy vulnerabilities.
-- Resource exhaustion, fork bombs, long-running builds, or other denial of
-  service.
+- Exhausting the host's total disk space; this release has no disk quota.
 - Side channels or complete secrecy of every host file and environment value.
 - Secrets deliberately placed in readable project files, compiler flags, or
   selected runtime/toolchain paths.
@@ -129,7 +138,7 @@ security boundary.
   subcommands, so a workspace can prevent `cargo-cage` from being started at
   all. Use the direct executable. See
   [Cargo issue #10049](https://github.com/rust-lang/cargo/issues/10049).
-- Seccomp, resource limits, a GUI, macOS/Windows support, dependency
+- Seccomp, disk quotas, a GUI, macOS/Windows support, dependency
   reputation, or AI-based detection.
 
 ## Residual risk
@@ -142,10 +151,11 @@ complete confidentiality or complete sandbox escape prevention.
 
 The independent Rust red-team runner in security/redteam is intentionally
 separate from the normal regression tests. It tries black-box writes, reads,
-sockets, process and namespace operations, target poisoning, and concurrent
-path swaps. A green run is useful evidence, not a proof against a kernel or
-sandbox vulnerability. It reports direct ptrace and bpf syscall probes as
-`NOT TESTED` rather than silently treating unavailable coverage as a pass.
+sockets, process and namespace operations, resource-budget abuse, target
+poisoning, and concurrent path swaps. A green run is useful evidence, not a
+proof against a kernel or sandbox vulnerability. It reports direct ptrace and
+bpf syscall probes as `NOT TESTED` rather than silently treating unavailable
+coverage as a pass.
 
 The dispatcher issue is worth spelling out: if the user runs `cargo cage
 build` and Cargo expands a repository or user alias named `cage`, `cargo-cage`

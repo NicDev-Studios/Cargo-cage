@@ -1,5 +1,6 @@
 use cage_core::{
-    CageError, CageResult, NetworkAccess, SandboxPolicy, is_sensitive_environment_name,
+    CageError, CageResult, NetworkAccess, ResourceLimits, SandboxPolicy,
+    is_sensitive_environment_name,
 };
 use std::env;
 use std::ffi::OsString;
@@ -68,6 +69,7 @@ pub fn cargo_policy(main_build: bool) -> CageResult<SandboxPolicy> {
 
     Ok(SandboxPolicy {
         network: NetworkAccess::Deny,
+        resources: ResourceLimits::default(),
         writable_paths: Vec::new(),
         hidden_paths,
         private_paths,

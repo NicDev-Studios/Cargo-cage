@@ -1,7 +1,7 @@
 use cage_core::{CageError, CageResult, SandboxBackend, SandboxOutcome, SandboxRequest};
 #[cfg(target_os = "linux")]
 use cage_core::{
-    Environment, NetworkAccess, OutputMode, ProcessStatus,
+    Environment, NetworkAccess, OutputMode, ProcessStatus, ResourceLimits,
     canonical_existing_path_without_symlinks, is_sensitive_environment_name,
 };
 #[cfg(all(test, target_os = "linux"))]
@@ -20,10 +20,14 @@ use std::path::{Component, Path};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
+use std::sync::Mutex;
+#[cfg(target_os = "linux")]
 mod mounts;
 #[cfg(target_os = "linux")]
 mod process;
 
+#[cfg(target_os = "linux")]
+use crate::resources::ResourceGroup;
 #[cfg(all(test, target_os = "linux"))]
 use crate::tree::{decode_mountinfo_path, validate_hardlink_aliases};
 #[cfg(target_os = "linux")]
@@ -37,8 +41,10 @@ use mounts::{
     MountArgument, MountArguments, MountKind, MountSource, build_bwrap_args, open_mount_source,
     private_mount_order, validate_opened_mount_kind,
 };
+#[cfg(all(test, target_os = "linux"))]
+use process::capture_command_output;
 #[cfg(target_os = "linux")]
-use process::{LauncherContext, capture_command_output};
+use process::{LauncherContext, capture_child_output, wait_for_child};
 #[cfg(all(test, target_os = "linux"))]
 use std::io::Read;
 
@@ -57,6 +63,8 @@ const MAX_CAPTURED_OUTPUT: usize = 1024 * 1024;
 #[cfg(target_os = "linux")]
 static NEXT_LAUNCHER_CONTEXT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static RESOURCE_RUN_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(target_os = "linux")]
 const NAMESPACE_PREFLIGHT_OUTPUT: &[u8] = b"cargo-cage-namespace-preflight-ok\n";
 #[cfg(target_os = "linux")]
@@ -186,6 +194,7 @@ impl LinuxSandbox {
         args: &[OsString],
         output_mode: OutputMode,
     ) -> CageResult<SandboxOutcome> {
+        let mut resource_group = ResourceGroup::prepare(plan.resources)?;
         let mounts = PreparedMounts::open(plan, &self.launcher)?;
         let launcher_context = LauncherContext::new()?;
         let mut command = Command::new(&self.bwrap);
@@ -205,46 +214,62 @@ impl LinuxSandbox {
             command.env_remove(key);
         }
 
-        match output_mode {
-            OutputMode::Inherit => {
-                let status = command.status().map_err(|source| CageError::ProcessSpawn {
-                    program: self.bwrap.clone(),
-                    source,
-                })?;
-                Ok(SandboxOutcome {
-                    status: ProcessStatus {
-                        code: status.code(),
-                    },
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                })
-            }
-            OutputMode::Capture => {
-                let output = capture_command_output(command).map_err(|source| {
-                    let detail = source.to_string();
-                    if detail.contains("safety limit") {
-                        CageError::sandbox_setup(
-                            self.bwrap.display().to_string(),
-                            "captured discovery output must stay below the safety limit",
-                            "fix the discovery command or retry with a normal Bubblewrap setup",
-                            detail,
-                        )
-                    } else {
-                        CageError::ProcessSpawn {
-                            program: self.bwrap.clone(),
-                            source,
-                        }
-                    }
-                })?;
-                Ok(SandboxOutcome {
-                    status: ProcessStatus {
-                        code: output.status.code(),
-                    },
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                })
-            }
+        if matches!(output_mode, OutputMode::Capture) {
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
         }
+
+        // Lower both soft and hard limits immediately before spawn. The child
+        // must inherit a hard ceiling it cannot raise, while policy
+        // construction and mount validation still run at the caller's limits.
+        resource_group.apply_inherited_limits()?;
+        resource_group.enter_current_process()?;
+        let mut child = command.spawn().map_err(|source| CageError::ProcessSpawn {
+            program: self.bwrap.clone(),
+            source,
+        })?;
+        if let Err(error) = resource_group.restore_current_process() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+
+        let run_result = match output_mode {
+            OutputMode::Inherit => {
+                let (status, wall_time_expired) = wait_for_child(
+                    &mut child,
+                    &resource_group,
+                    resource_group.limits().max_wall_time,
+                )?;
+                Ok((
+                    std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    wall_time_expired,
+                ))
+            }
+            OutputMode::Capture => capture_child_output(
+                child,
+                &resource_group,
+                resource_group.limits().max_wall_time,
+            ),
+        };
+        let report = resource_group.finish()?;
+        let (output, wall_time_expired) = run_result?;
+        if let Some(error) = report.resource_error(&output.status, wall_time_expired) {
+            return Err(error);
+        }
+        Ok(SandboxOutcome {
+            status: ProcessStatus {
+                code: output.status.code(),
+            },
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
@@ -258,6 +283,14 @@ impl SandboxBackend for LinuxSandbox {
 
         #[cfg(target_os = "linux")]
         {
+            let _resource_run_lock = RESOURCE_RUN_LOCK.lock().map_err(|_| {
+                CageError::sandbox_setup(
+                    "cargo-cage resource supervisor",
+                    "sandbox runs must be serialized while the current process enters a cgroup",
+                    "restart cargo-cage after the previous sandbox run panicked",
+                    "the process-global resource-run lock was poisoned",
+                )
+            })?;
             let plan = SandboxPlan::from_request(request)?;
             let mut namespace_markers = parent_namespace_markers()?;
             if plan.network == NetworkAccess::Allow {
@@ -304,6 +337,7 @@ struct SandboxPlan {
     cargo_cache_paths: Vec<PathBuf>,
     environment: Environment,
     network: NetworkAccess,
+    resources: ResourceLimits,
 }
 
 #[cfg(target_os = "linux")]
@@ -410,6 +444,7 @@ impl SandboxPlan {
             cargo_cache_paths,
             environment,
             network: request.policy.network,
+            resources: request.policy.resources,
         })
     }
 }
@@ -1227,6 +1262,7 @@ mod tests {
                 remove: vec![OsString::from("SSH_AUTH_SOCK")],
             },
             network: NetworkAccess::Deny,
+            resources: ResourceLimits::default(),
         };
         let args = build_bwrap_args(
             &plan,
@@ -1322,6 +1358,7 @@ mod tests {
             cargo_cache_paths: Vec::new(),
             environment: Environment::clean(),
             network: NetworkAccess::Deny,
+            resources: ResourceLimits::default(),
         };
         let mounts = MountArguments {
             runtime: vec![MountArgument {
@@ -1478,6 +1515,7 @@ mod tests {
             cargo_cache_paths: Vec::new(),
             environment: Environment::clean().set("PATH", "/usr/bin"),
             network: NetworkAccess::Deny,
+            resources: ResourceLimits::default(),
         };
         let args = build_bwrap_args(&plan, Path::new("/bin/sh"), &[]);
         assert!(args.iter().any(|arg| arg == "--clearenv"));
@@ -1518,6 +1556,7 @@ mod tests {
             cargo_cache_paths: Vec::new(),
             environment,
             network: NetworkAccess::Deny,
+            resources: ResourceLimits::default(),
         };
         let args = build_bwrap_args(&plan, Path::new("/bin/sh"), &[]);
         assert!(!contains_pair(

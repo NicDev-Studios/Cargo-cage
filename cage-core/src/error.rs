@@ -5,6 +5,30 @@ use std::path::PathBuf;
 
 pub type CageResult<T> = Result<T, CageError>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceLimitKind {
+    Processes,
+    Memory,
+    Cpu,
+    WallTime,
+    FileSize,
+    OpenFiles,
+}
+
+impl fmt::Display for ResourceLimitKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Processes => "process count",
+            Self::Memory => "memory",
+            Self::Cpu => "CPU",
+            Self::WallTime => "wall-clock time",
+            Self::FileSize => "file size",
+            Self::OpenFiles => "open file descriptors",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug)]
 pub struct PolicyViolation {
     pub subject: String,
@@ -65,6 +89,13 @@ pub enum CageError {
     },
     ProcessFailed {
         status: ProcessStatus,
+        detail: String,
+    },
+    ResourceLimitExceeded {
+        kind: ResourceLimitKind,
+        limit: String,
+        status: Option<ProcessStatus>,
+        remedy: String,
         detail: String,
     },
     Io {
@@ -135,6 +166,22 @@ impl fmt::Display for CageError {
                     status.code
                 )
             }
+            Self::ResourceLimitExceeded {
+                kind,
+                limit,
+                status,
+                remedy,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "sandbox resource limit exceeded for {kind} ({limit}): {detail}"
+                )?;
+                if let Some(status) = status {
+                    write!(f, "; process status: {:?}", status.code)?;
+                }
+                write!(f, "; remedy: {remedy}")
+            }
             Self::Io { context, source } => write!(f, "{context}: {source}"),
         }
     }
@@ -183,5 +230,20 @@ mod tests {
         assert_eq!(failure.remedy, "install a working Bubblewrap binary");
         assert_eq!(failure.detail, "permission denied");
         assert!(error.to_string().contains("remedy:"));
+    }
+
+    #[test]
+    fn resource_errors_explain_limit_and_remedy() {
+        let error = CageError::ResourceLimitExceeded {
+            kind: ResourceLimitKind::Processes,
+            limit: "512 processes".to_owned(),
+            status: Some(ProcessStatus { code: None }),
+            remedy: "split the build or run it in a trusted environment".to_owned(),
+            detail: "pids.max reached".to_owned(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("process count"));
+        assert!(text.contains("512 processes"));
+        assert!(text.contains("remedy:"));
     }
 }

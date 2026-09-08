@@ -15,7 +15,7 @@ use workspace::{
 use workspace::{discovery_writable_paths, manifest_parent_path, workspace_from_output};
 
 use cage_core::{
-    CageError, CageResult, OutputMode, SandboxBackend, SandboxRequest,
+    CageError, CageResult, OutputMode, ResourceLimits, SandboxBackend, SandboxRequest,
     canonical_existing_path_without_symlinks,
 };
 use std::env;
@@ -340,6 +340,15 @@ fn run_doctor(verbose: bool, backend: &dyn SandboxBackend) -> CageResult<i32> {
             Ok(outcome) if outcome.status.successfully_exited() => {
                 println!("  OK   Bubblewrap namespaces and sandbox preflight");
                 println!("  OK   Landlock ABI 5 filesystem enforcement");
+                println!(
+                    "  OK   resource budget: up to {} processes, {} GiB host/parent-clamped memory, {} CPU cores, {} minutes, {} GiB per-file, {} open descriptors",
+                    ResourceLimits::MAX_PROCESSES,
+                    ResourceLimits::MAX_MEMORY_BYTES / (1024 * 1024 * 1024),
+                    ResourceLimits::MAX_CPU_CORES,
+                    ResourceLimits::MAX_WALL_TIME.as_secs() / 60,
+                    ResourceLimits::MAX_FILE_SIZE_BYTES / (1024 * 1024 * 1024),
+                    ResourceLimits::MAX_OPEN_FILES,
+                );
             }
             Ok(outcome) => {
                 println!(

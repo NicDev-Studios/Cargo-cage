@@ -288,6 +288,9 @@ fn manifest_path(name: &str) -> PathBuf {
         run!("runtime-paths", attack_runtime_paths);
         run!("namespace-tools", attack_namespace_tools);
         run!("child-process", attack_child_process);
+        run!("process-budget", attack_process_budget);
+        run!("file-size-budget", attack_file_size_budget);
+        run!("open-file-budget", attack_open_file_budget);
         run!("target-hardlink", attack_target_hardlink);
         run!("target-symlink", attack_target_symlink);
         run!("target-freshness", attack_target_freshness);
@@ -939,6 +942,58 @@ match child {
         expect_denied(case)
     }
 
+    fn attack_process_budget(config: &Config) -> Result<(), String> {
+        let case = new_attack(
+            config,
+            "process-budget",
+            r#"
+let mut children = Vec::new();
+for _ in 0..1024 {
+    match Command::new("/bin/sleep").arg("5").spawn() {
+        Ok(child) => children.push(child),
+        Err(_) => denied("the process budget denied a new child"),
+    }
+}
+bypass("the build created all process-budget children");
+"#,
+        )?;
+        expect_denied(case)
+    }
+
+    fn attack_file_size_budget(config: &Config) -> Result<(), String> {
+        let case = new_attack(
+            config,
+            "file-size-budget",
+            r#"
+let path = PathBuf::from("/tmp/redteam-file-size");
+let file = fs::File::create(&path).expect("create private file");
+match file.set_len(5 * 1024 * 1024 * 1024) {
+    Ok(()) => bypass("the build exceeded RLIMIT_FSIZE"),
+    Err(_) => denied("the file-size budget rejected the oversized file"),
+}
+"#,
+        )?;
+        expect_denied(case)
+    }
+
+    fn attack_open_file_budget(config: &Config) -> Result<(), String> {
+        let case = new_attack(
+            config,
+            "open-file-budget",
+            r#"
+let mut files = Vec::new();
+for _ in 0..20_000 {
+    match fs::File::open("/dev/null") {
+        Ok(file) => files.push(file),
+        Err(_) => denied("the open-file budget denied a new descriptor"),
+    }
+}
+bypass("the build exceeded RLIMIT_NOFILE");
+"#,
+        )?;
+        expect_denied(case)
+    }
+
     fn attack_target_hardlink(config: &Config) -> Result<(), String> {
         let case = new_attack(
             config,
@@ -1171,7 +1226,9 @@ match fs::write(target.join("sentinel"), b"race escape") {
 
     fn has_policy_context(text: &str) -> bool {
         (text.contains("CAGE_POLICY_DENIED") && text.contains("cargo-cage: remedy:"))
-            || ((text.contains("sandbox policy error") || text.contains("sandbox setup failed"))
+            || ((text.contains("sandbox policy error")
+                || text.contains("sandbox setup failed")
+                || text.contains("sandbox resource limit exceeded"))
                 && text.contains("remedy:"))
     }
 

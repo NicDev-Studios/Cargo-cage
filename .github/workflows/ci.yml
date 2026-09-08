@@ -32,6 +32,30 @@ jobs:
         run: bash .github/scripts/install-bubblewrap.sh
       - name: Install red-team tools
         run: sudo apt-get install --yes python3 util-linux
+      - name: Prepare delegated cgroup v2 resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=/sys/fs/cgroup
+          group="$root/cargo-cage-ci"
+          if sudo test -e "$group"; then
+            echo "::error::delegated cgroup path already exists: $group"
+            exit 1
+          fi
+          for controller in cpu memory pids; do
+            sudo grep -qw "$controller" "$root/cgroup.controllers" || {
+              echo "::error::required cgroup controller is unavailable: $controller"
+              exit 1
+            }
+          done
+          sudo sh -c 'printf "+cpu +memory +pids\n" > /sys/fs/cgroup/cgroup.subtree_control'
+          sudo mkdir "$group"
+          sudo grep -qw cpu "$root/cgroup.subtree_control"
+          sudo grep -qw memory "$root/cgroup.subtree_control"
+          sudo grep -qw pids "$root/cgroup.subtree_control"
+          sudo sh -c "printf '+cpu +memory +pids\\n' > '$group/cgroup.subtree_control'"
+          sudo chown "$USER":"$USER" "$group" "$group/cgroup.procs" "$group/cgroup.subtree_control"
+          sudo sh -c "printf '%s\\n' '$PPID' > '$group/cgroup.procs'"
       - name: Check sandbox runtime
         run: |
           bwrap --version
@@ -61,3 +85,15 @@ jobs:
           cargo-cage-version: 0.1.0-alpha.2
           command: build
           args: --locked --workspace
+      - name: Clean up delegated cgroup v2 resources
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=/sys/fs/cgroup
+          group="$root/cargo-cage-ci"
+          if [[ -d "$group" ]]; then
+            sudo sh -c "printf '%s\\n' '$BASHPID' > '$root/cgroup.procs'; printf '%s\\n' '$PPID' > '$root/cgroup.procs'"
+            sudo sh -c "printf '1\\n' > '$group/cgroup.kill'"
+            sudo rmdir "$group"
+          fi

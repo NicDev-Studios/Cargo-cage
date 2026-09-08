@@ -37,6 +37,16 @@ restrictions are enabled as an additional layer.
 Network access is denied twice: Bubblewrap gets a separate network namespace,
 and Cargo is forced into offline mode. There is no automatic fetch.
 
+Every Bubblewrap process is also started from a private delegated cgroup-v2
+child. The default budget is 512 processes, an 8 GiB memory ceiling clamped to
+75% of available host memory and the parent cgroup, four CPU cores, 30 minutes
+of wall-clock time, a 4 GiB per-file limit, and 16,384 open descriptors. An
+effective memory budget below 1 GiB is rejected. Swap is disabled for the
+build cgroup and core dumps are disabled. If cgroup-v2 delegation or cleanup
+cannot be proved, the build stops before Cargo.
+There is no CLI switch that disables or raises this profile; smaller explicit
+budgets are for embedding and tests only.
+
 The child starts with an empty environment. A fixed allowlist supplies the
 Cargo/Rust, compiler, locale, and terminal values needed for normal builds.
 Credentials, agent variables, `CARGO_HOME`, `RUSTUP_HOME`, and arbitrary host
@@ -113,11 +123,13 @@ publishing details.
 
 ## Known limits
 
-This release deliberately has no Seccomp, resource limits, or syscall audit
-log. It does not defend against kernel, Bubblewrap, Cargo, Rustc, toolchain, or
-host-policy vulnerabilities. It does not prevent resource DoS, fork bombs,
-side channels, every possible secret exposure, or all races caused by another
-local process changing paths while setup is in progress.
+This release deliberately has no Seccomp, disk-space quota, or syscall audit
+log. Resource limits reduce process, memory, CPU, file-size, descriptor, and
+wall-clock abuse, but they do not guarantee that a build cannot consume all
+available disk space. The project also does not defend against kernel,
+Bubblewrap, Cargo, Rustc, toolchain, or host-policy vulnerabilities. Side
+channels, every possible secret exposure, and all races caused by another
+local process changing paths while setup is in progress remain out of scope.
 
 The default target run is retained below target/.cargo-cage/runs/ and remains
 untrusted. --reuse-target is an explicit trusted-workspace exception and
