@@ -973,7 +973,7 @@ match file.set_len(5 * 1024 * 1024 * 1024) {
 }
 "#,
         )?;
-        expect_denied(case)
+        expect_resource_denied(case)
     }
 
     fn attack_open_file_budget(config: &Config) -> Result<(), String> {
@@ -1144,6 +1144,27 @@ match fs::write(target.join("sentinel"), b"race escape") {
 
     fn expect_denied(case: Case) -> Result<(), String> {
         expect_denied_with_secrets(case, &[])
+    }
+
+    fn expect_resource_denied(case: Case) -> Result<(), String> {
+        let before = case.sentinel().map_err(io_text)?;
+        let output = case.run().map_err(io_text)?;
+        let after = case.sentinel().map_err(io_text)?;
+        if before != after {
+            return fail_case(&case, "resource attack changed the external sentinel");
+        }
+        let text = output_text(&output);
+        if output.status.success() || text.contains("CAGE_POLICY_BYPASSED") {
+            return fail_output(&case, "resource attack", &output);
+        }
+        if !text.contains("cargo-cage: policy active:") || !text.contains("cargo-cage: remedy:") {
+            return fail_case(
+                &case,
+                "resource attack failed without cargo-cage policy context",
+            );
+        }
+        case.finish();
+        Ok(())
     }
 
     fn expect_denied_with_secrets(case: Case, secrets: &[&str]) -> Result<(), String> {

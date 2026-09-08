@@ -178,7 +178,8 @@ impl ResourceGroup {
 
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         loop {
-            if cgroup_is_empty(&self.path)? {
+            if cgroup_tree_is_empty(&self.path)? {
+                remove_descendant_cgroups(&self.path)?;
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -197,8 +198,10 @@ impl ResourceGroup {
         if self.entered {
             self.restore_current_process()?;
         }
-        if !cgroup_is_empty(&self.path)? {
+        if !cgroup_tree_is_empty(&self.path)? {
             self.kill_all()?;
+        } else {
+            remove_descendant_cgroups(&self.path)?;
         }
         let after = read_events(&self.path).map_err(|error| {
             cgroup_setup_error(
@@ -241,6 +244,7 @@ impl Drop for ResourceGroup {
         if supervisor_restored {
             let _ = self.kill_all();
         }
+        let _ = remove_descendant_cgroups(&self.path);
         let _ = fs::remove_dir(&self.path);
     }
 }
@@ -561,6 +565,76 @@ fn cgroup_is_empty(path: &Path) -> CageResult<bool> {
     Ok(read_text(&path.join("cgroup.procs"))?
         .lines()
         .all(|line| line.trim().is_empty()))
+}
+
+fn cgroup_tree_is_empty(path: &Path) -> CageResult<bool> {
+    if !cgroup_is_empty(path)? {
+        return Ok(false);
+    }
+    for child in child_cgroups(path)? {
+        if !cgroup_tree_is_empty(&child)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn child_cgroups(path: &Path) -> CageResult<Vec<PathBuf>> {
+    let entries = fs::read_dir(path).map_err(|error| {
+        cgroup_setup_error(
+            path.display().to_string(),
+            "the resource cgroup hierarchy must remain readable during cleanup",
+            "use a delegated cgroup v2 subtree with readable child directories",
+            error.to_string(),
+        )
+    })?;
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            cgroup_setup_error(
+                path.display().to_string(),
+                "the resource cgroup hierarchy must remain enumerable during cleanup",
+                "use a delegated cgroup v2 subtree with stable cgroup entries",
+                error.to_string(),
+            )
+        })?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child).map_err(|error| {
+            cgroup_setup_error(
+                child.display().to_string(),
+                "resource cgroup children must be inspectable without symlink traversal",
+                "remove unexpected cgroup entries and retry",
+                error.to_string(),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(cgroup_setup_error(
+                child.display().to_string(),
+                "resource cgroup children must not be symlinks",
+                "remove the unexpected cgroup entry and retry",
+                "symlinked cgroup child found during cleanup",
+            ));
+        }
+        if metadata.is_dir() {
+            children.push(child);
+        }
+    }
+    Ok(children)
+}
+
+fn remove_descendant_cgroups(path: &Path) -> CageResult<()> {
+    for child in child_cgroups(path)? {
+        remove_descendant_cgroups(&child)?;
+        fs::remove_dir(&child).map_err(|error| {
+            cgroup_setup_error(
+                child.display().to_string(),
+                "empty descendant resource cgroups must be removable after cleanup",
+                "terminate remaining descendants and retry on a working cgroup v2 host",
+                error.to_string(),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn read_events(path: &Path) -> io::Result<EventCounters> {
