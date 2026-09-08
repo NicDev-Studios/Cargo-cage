@@ -66,6 +66,23 @@ There is no unsandboxed fallback. If Bubblewrap is absent, too old, not
 executable, cannot complete its preflight, or Landlock/openat2 cannot provide
 the required policy, the build stops.
 
+## Release supply chain
+
+The crates.io release workflow is prepared for Trusted Publishing with GitHub
+OIDC. Each of the four public crates must be bound to this repository, this
+workflow file, and the protected `crates-io` environment. Once configured, the
+workflow receives only a short-lived publishing token after the full CI gate
+and package dry-runs have passed. A long-lived `CARGO_REGISTRY_TOKEN` secret is
+not used, and there is no secret fallback if OIDC authentication fails.
+
+Future GitHub releases must be created as drafts and published with release
+immutability enabled. After publication, the tag and release assets must not
+be moved or edited. GitHub creates a release attestation for an immutable
+release; that attestation describes provenance and integrity of the release,
+not the security of the sandbox or the correctness of its code. The current
+alpha intentionally ships source archives only, so it does not claim binary
+artifact attestations.
+
 The Landlock launcher is deliberately context-bound: Bubblewrap creates a
 private marker before the launcher is reached, and the launcher rejects direct
 use without that marker as well as filesystem-root policy paths. The launcher

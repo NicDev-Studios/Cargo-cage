@@ -142,6 +142,22 @@ advisory database. A clean audit means no matching advisory is known at that
 point; it is not a claim that the dependencies or the host toolchain are
 perfect.
 
+## Release integrity
+
+The crates.io release workflow is prepared for Trusted Publishing. After the
+four public crates are configured with their exact repository, workflow, and
+`crates-io` environment, it gets a short-lived OIDC-backed publishing token
+instead of keeping a long-lived crates.io token in GitHub Secrets. The workflow
+runs its full CI gate and package dry-runs before it requests that token, and
+it never falls back to a normal registry secret.
+
+Future GitHub releases are intended to use GitHub's immutable release setting.
+Once a release is published, its release tag and attached assets must not be
+edited or moved. GitHub's resulting release attestation proves the tag,
+commit, and release provenance; it does not prove that the code itself is
+secure. The alpha remains source-only for now. There are no prebuilt binaries
+or individual binary artifact attestations yet.
+
 ## Before pushing
 
 Run the repository's Rust-only local CI mirror before opening a pull request:

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,6 +46,8 @@ fn run(require_linux: bool) -> Result<(), String> {
         .join("../..")
         .canonicalize()
         .map_err(|error| format!("cannot resolve repository root: {error}"))?;
+
+    validate_release_workflow(&repo_root)?;
 
     step(
         &repo_root,
@@ -167,6 +170,86 @@ fn run(require_linux: bool) -> Result<(), String> {
     }
 
     eprintln!("cargo-cage local-check: all applicable checks passed");
+    Ok(())
+}
+
+fn validate_release_workflow(repo_root: &Path) -> Result<(), String> {
+    const AUTH_ACTION: &str =
+        "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18";
+    const REGISTRY_TOKEN_OUTPUT: &str =
+        "CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}";
+
+    let path = repo_root.join(".github/workflows/release.yml");
+    let workflow = fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+
+    if workflow.contains("secrets.CARGO_REGISTRY_TOKEN") {
+        return Err(
+            "release workflow still references the long-lived CARGO_REGISTRY_TOKEN secret"
+                .to_owned(),
+        );
+    }
+    if workflow.matches("id-token: write").count() != 1 {
+        return Err(
+            "release workflow must grant id-token: write exactly to the publish job".to_owned(),
+        );
+    }
+    if !workflow.contains(AUTH_ACTION) {
+        return Err(format!(
+            "release workflow must pin the crates.io auth action to {AUTH_ACTION}"
+        ));
+    }
+    if !workflow.contains(REGISTRY_TOKEN_OUTPUT) {
+        return Err(
+            "release workflow must pass only the short-lived crates.io auth output to cargo publish"
+                .to_owned(),
+        );
+    }
+
+    let dry_run = workflow
+        .find("name: Dry-run packages without registry credentials")
+        .ok_or_else(|| {
+            "release workflow is missing the credential-free package dry-run".to_owned()
+        })?;
+    let auth = workflow
+        .find("name: Authenticate with crates.io")
+        .ok_or_else(|| "release workflow is missing the crates.io OIDC auth step".to_owned())?;
+    let publish = workflow
+        .find("name: Publish packages in dependency order")
+        .ok_or_else(|| "release workflow is missing the publish step".to_owned())?;
+    if !(dry_run < auth && auth < publish) {
+        return Err(
+            "release workflow must dry-run packages before OIDC auth and publish".to_owned(),
+        );
+    }
+    if !workflow.contains("cargo publish --locked --package \"$package\" --dry-run") {
+        return Err("release workflow dry-run must use locked Cargo packages".to_owned());
+    }
+    if !workflow.contains("cargo publish --locked --package \"$package\" --no-verify") {
+        return Err(
+            "release workflow publish must use the verified --no-verify upload path".to_owned(),
+        );
+    }
+
+    if !workflow.contains("gh api --include") || !workflow.contains("--json isDraft") {
+        return Err(
+            "release workflow must inspect existing releases before editing or creating them"
+                .to_owned(),
+        );
+    }
+    if !workflow.contains("immutable releases must never be edited or moved") {
+        return Err(
+            "release workflow must fail when the existing release is already published".to_owned(),
+        );
+    }
+    if !workflow.contains("- \"v*.*.*\"") || workflow.contains("- \"v*\"") {
+        return Err(
+            "release workflow must trigger only on semver-shaped tags, not the moving v1 action tag"
+                .to_owned(),
+        );
+    }
+
+    eprintln!("cargo-cage local-check: release workflow policy: ok");
     Ok(())
 }
 
