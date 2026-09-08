@@ -58,7 +58,7 @@ dedicated build service, or a careful review of the code you build.
 The same policy is used for `build`, `check`, `test`, and `doc`. `doctor`
 checks the setup without creating or changing project files.
 
-This is an early public alpha, 0.1.0-alpha.2. It is deliberately rough around
+This is an early public alpha, 0.1.0-alpha.3. It is deliberately rough around
 the edges and should not be mistaken for a production-grade sandbox.
 
 ## Requirements and installation
@@ -91,7 +91,7 @@ delegation through the host's service manager and then run `cargo-cage doctor`.
 Once the alpha is published, install it from crates.io with:
 
 ```sh
-cargo install cargo-cage --locked --version 0.1.0-alpha.2
+cargo install cargo-cage --locked --version 0.1.0-alpha.3
 ```
 
 The public crates are named consistently on crates.io:
@@ -132,7 +132,7 @@ Cargo operations. Additional arguments go in `args`:
 ```
 
 `@v1` is the Action's Git tag, not the Cargo package version. The action pins
-the installed CLI to `0.1.0-alpha.2` by default; set `cargo-cage-version`
+the installed CLI to `0.1.0-alpha.3` by default; set `cargo-cage-version`
 explicitly when using another published version. For a supply-chain-sensitive
 workflow, pin the Action itself to a full commit SHA instead of the moving
 `v1` tag.

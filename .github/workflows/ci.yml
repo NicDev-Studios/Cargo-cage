@@ -87,7 +87,7 @@ jobs:
         uses: ./
         with:
           install-from-source: true
-          cargo-cage-version: 0.1.0-alpha.2
+          cargo-cage-version: 0.1.0-alpha.3
           command: build
           args: --locked --workspace
       - name: Clean up delegated cgroup v2 resources
