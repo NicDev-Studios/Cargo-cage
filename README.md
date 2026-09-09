@@ -161,8 +161,10 @@ The crates.io release workflow is prepared for Trusted Publishing. After the
 four public crates are configured with their exact repository, workflow, and
 `crates-io` environment, it gets a short-lived OIDC-backed publishing token
 instead of keeping a long-lived crates.io token in GitHub Secrets. The workflow
-runs its full CI gate and package dry-runs before it requests that token, and
-it never falls back to a normal registry secret.
+runs its full CI gate and inspects package contents before it requests that
+token. The first crate is dry-run before authentication; each dependent crate
+is dry-run without credentials after its published dependencies are visible and
+before its own upload. It never falls back to a normal registry secret.
 
 Future GitHub releases are intended to use GitHub's immutable release setting.
 Once a release is published, its release tag and attached assets must not be
