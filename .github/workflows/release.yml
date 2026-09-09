@@ -324,7 +324,21 @@ jobs:
       - name: Install cargo-cage from crates.io
         env:
           VERSION: ${{ env.RELEASE_TAG }}
-        run: cargo install cargo-cage --locked --version "${VERSION#v}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          for attempt in {1..24}; do
+            if cargo install cargo-cage --locked --version "$version"; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 24 ]]; then
+              echo "::error::cargo-cage $version was not installable from crates.io after waiting for registry propagation"
+              exit 1
+            fi
+            echo "cargo-cage $version is not visible to this fresh runner yet; retrying in 5s (attempt $attempt/24)"
+            sleep 5
+          done
 
       - name: Run a clean Cargo smoke build
         shell: bash
