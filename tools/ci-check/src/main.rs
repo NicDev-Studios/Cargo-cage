@@ -264,6 +264,12 @@ fn validate_release_workflow(repo_root: &Path) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    if !workflow.contains("workflow_dispatch:") || !workflow.contains("release_tag:") {
+        return Err(
+            "release workflow must support resuming a partially published tag without moving it"
+                .to_owned(),
+        );
+    }
 
     eprintln!("cargo-cage local-check: release workflow policy: ok");
     Ok(())
