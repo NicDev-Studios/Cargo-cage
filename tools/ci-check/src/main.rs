@@ -225,16 +225,18 @@ fn validate_release_workflow(repo_root: &Path) -> Result<(), String> {
     if !workflow.contains("cargo publish --locked --package \"$package\" --dry-run") {
         return Err("release workflow dry-run must use locked Cargo packages".to_owned());
     }
+    if !workflow.contains("cargo publish --locked --package \"$package\" --no-verify") {
+        return Err("release workflow must use the locked --no-verify upload path".to_owned());
+    }
     for package in [
         "cargo-cage-core",
         "cargo-cage-cargo",
         "cargo-cage-linux",
         "cargo-cage",
     ] {
-        let upload = format!("cargo publish --locked --package {package} --no-verify");
-        if !workflow.contains(&upload) {
+        if !workflow.contains(package) {
             return Err(format!(
-                "release workflow is missing the --no-verify upload for {package}"
+                "release workflow is missing the upload target {package}"
             ));
         }
     }
